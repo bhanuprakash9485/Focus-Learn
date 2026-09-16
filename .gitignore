@@ -1,0 +1,24 @@
+# Secrets — never commit API keys
+.env
+.env.*
+!.env.example
+backend/.env
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local SQLite data (user accounts, sessions)
+backend/data/
+
+# Logs & editor files
+*.log
+.DS_Store
