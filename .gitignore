@@ -4,11 +4,17 @@
 !.env.example
 backend/.env
 
+# Firebase server credentials — never commit service-account keys
+*serviceAccount*.json
+*firebase-adminsdk*.json
+serviceAccountKey.json
+
 # Dependencies
 node_modules/
 
 # Build output
 dist/
+.vite/
 
 # Python
 __pycache__/

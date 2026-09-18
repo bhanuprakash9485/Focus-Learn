@@ -30,7 +30,7 @@ export default function StudyPlan() {
     items.push({ id: `plan-${nextUp.lesson.id}`, title: nextUp.lesson.title, minutes: lessonMin, kind: 'lesson', to: `/focus/${nextUp.lesson.id}` })
     remaining -= lessonMin
     if (remaining >= 5) {
-      items.push({ id: `plan-quiz-${nextUp.lesson.id}`, title: 'Understanding check', minutes: Math.min(10, remaining), kind: 'quiz', to: `/quiz/${nextUp.lesson.id}` })
+      items.push({ id: `plan-quiz-${nextUp.lesson.id}`, title: 'Topic quiz', minutes: Math.min(10, remaining), kind: 'quiz', to: `/quiz/topic/${encodeURIComponent(nextUp.lesson.title)}` })
       remaining -= Math.min(10, remaining)
     }
     if (weakAreas.length > 0 && remaining >= 5) {

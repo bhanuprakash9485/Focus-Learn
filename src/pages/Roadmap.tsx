@@ -188,8 +188,8 @@ export default function RoadmapPage() {
                             {quizExistsForLesson(lesson.id) && done && (
                               <button
                                 className="btn btn-ghost"
-                                onClick={() => navigate(`/quiz/${lesson.id}`)}
-                                title="Retake the understanding check"
+                                onClick={() => navigate(`/quiz/topic/${encodeURIComponent(lesson.title)}`)}
+                                title="Take the 30-question topic quiz"
                               >
                                 <IconQuiz size={15} />
                                 Quiz

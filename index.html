@@ -9,6 +9,23 @@
       content="FocusLearn — An AI-powered learning platform that creates your roadmap, removes distractions, checks your understanding, and guides your next step."
     />
     <title>FocusLearn — Learn What Matters. Stay Focused.</title>
+    <script>
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('focuslearn-theme')
+          var pref =
+            stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'light'
+          var dark =
+            pref === 'dark' ||
+            (pref === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          var root = document.documentElement
+          root.setAttribute('data-theme', dark ? 'dark' : 'light')
+          root.style.colorScheme = dark ? 'dark' : 'light'
+        } catch (e) {
+          /* Theme storage unavailable — the default light theme applies. */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

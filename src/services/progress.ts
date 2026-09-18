@@ -1,6 +1,5 @@
 import type { Roadmap, RoadmapStep, StepStatus } from '../types'
 import type { QuizAttempt } from '../types'
-import { quizzes } from '../data/student'
 
 /** Compute the status of a roadmap step from completed lesson ids. */
 export function getStepStatus(step: RoadmapStep, completedLessonIds: string[]): StepStatus {
@@ -31,9 +30,13 @@ export function getNextLesson(roadmap: Roadmap, completedLessonIds: string[]) {
   return null
 }
 
-/** True when a lesson has a quiz available in the bank. */
-export function quizExistsForLesson(lessonId: string): boolean {
-  return lessonId in quizzes
+/**
+ * True when a lesson has a quiz. Every roadmap lesson now maps to an
+ * on-demand 30-question topic quiz (10 basic / 10 moderate / 10 advanced),
+ * generated in the background by the backend. Nothing is pre-seeded.
+ */
+export function quizExistsForLesson(_lessonId: string): boolean {
+  return true
 }
 
 /** Average score across attempts (0-100), or null with no attempts. */
@@ -43,24 +46,37 @@ export function getAverageScore(attempts: QuizAttempt[]): number | null {
   return Math.round(sum / attempts.length)
 }
 
+/** Reader-friendly label for a quiz attempt's lesson id. */
+function friendlyLessonTitle(lessonId: string): string {
+  const name = lessonId.startsWith('topic-') ? lessonId.slice('topic-'.length) : lessonId
+  const words = name
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+  if (words.length === 0) return 'Topic quiz'
+  return words.map((w) => (w.length > 2 ? w[0].toUpperCase() + w.slice(1) : w.toUpperCase())).join(' ')
+}
+
 /**
- * Weak-area analysis: finds quiz questions the student missed most,
- * mapped back to their lesson titles. This is the seam where the AI
- * "identify weak areas" feature will plug in later.
+ * Weak-area analysis: groups real quiz attempts by lesson and counts the
+ * questions each student missed. Works for both server-driven topic quizzes
+ * (they carry a topicName + server question ids) and legacy lesson attempts.
  */
 export function getWeakAreas(attempts: QuizAttempt[]) {
-  const missCount = new Map<string, number>()
-  attempts.forEach((a) => a.missedQuestionIds.forEach((qid) => {
-    missCount.set(qid, (missCount.get(qid) ?? 0) + 1)
-  }))
-
   const topics: { topic: string; lessonId: string; missed: number }[] = []
-  for (const quiz of Object.values(quizzes)) {
-    for (const q of quiz.questions) {
-      const missed = missCount.get(q.id)
-      if (missed) {
-        topics.push({ topic: quiz.title.replace(' — Check', ''), lessonId: quiz.lessonId, missed })
-      }
+  for (const attempt of attempts) {
+    const missed = attempt.missedQuestionIds?.length ?? 0
+    if (missed === 0) continue
+    const title = attempt.topicName ?? friendlyLessonTitle(attempt.lessonId)
+    const existing = topics.find(
+      (t) => t.lessonId === attempt.lessonId || t.topic.toLowerCase() === title.toLowerCase(),
+    )
+    if (existing) {
+      existing.missed += missed
+    } else {
+      topics.push({ topic: title, lessonId: attempt.lessonId, missed })
     }
   }
   return topics.sort((a, b) => b.missed - a.missed).slice(0, 4)

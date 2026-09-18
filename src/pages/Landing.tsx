@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom'
 import { Logo } from '../components/Logo'
+import { ThemeToggle } from '../components/ThemeToggle'
 import {
   IconArrowRight,
   IconCheck,
@@ -98,9 +99,12 @@ export default function Landing() {
           <a href="#how">How it works</a>
           <Link to="/login">Log in</Link>
         </div>
-        <Link to="/signup" className="btn btn-primary">
-          Get Started
-        </Link>
+        <div className="row" style={{ gap: '0.7rem' }}>
+          <ThemeToggle />
+          <Link to="/signup" className="btn btn-primary">
+            Get Started
+          </Link>
+        </div>
       </nav>
 
       <header className="landing-hero">

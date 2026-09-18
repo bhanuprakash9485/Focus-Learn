@@ -1,4 +1,4 @@
-import type { AiGeneratedRoadmap, AiRoadmapTopic, AiTopicStatus, Goal, Quiz, Roadmap, User } from '../types'
+import type { AiGeneratedRoadmap, AiRoadmapTopic, AiTopicStatus, Goal, Quiz, QuizDifficulty, QuizQuestion, Roadmap, User } from '../types'
 import { goals as goalCatalog } from '../data/goals'
 import { getRoadmapForGoal } from '../data/roadmaps'
 import { apiUrl } from '../config/api'
@@ -1109,7 +1109,7 @@ export interface AnalyzePerformanceInput {
   roadmap_topic: string
   quiz_score: number
   total_questions: number
-  questions: { prompt: string; options: string[]; correctIndex: number; concept: string }[]
+  questions: { prompt: string; options: string[]; correctIndex: number; concept: string; difficulty?: string }[]
   answers: number[]
   correct_answers: number[]
 }
@@ -1157,9 +1157,9 @@ export async function analyzeQuizPerformance(
           roadmap_topic: input.roadmap_topic.slice(0, 200),
           quiz_score: input.quiz_score,
           total_questions: input.total_questions,
-          questions: input.questions.slice(0, 20),
-          answers: input.answers.slice(0, 20),
-          correct_answers: input.correct_answers.slice(0, 20),
+          questions: input.questions.slice(0, 60),
+          answers: input.answers.slice(0, 60),
+          correct_answers: input.correct_answers.slice(0, 60),
         }),
         signal: controller.signal,
       })
@@ -1330,6 +1330,159 @@ export async function createRoadmap(input: {
     return {
       state: 'error',
       message: 'Unable to generate your roadmap right now. Please try again.',
+    }
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Topic quiz generation — real Groq-backed, 30+ questions             */
+/* ------------------------------------------------------------------ */
+
+const QUIZ_DIFFICULTIES: QuizDifficulty[] = ['basic', 'moderate', 'advanced']
+
+/** Normalize a raw tier label (legacy "intermediate" -> "moderate"). */
+function normalizeDifficulty(raw: unknown): QuizDifficulty | undefined {
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === 'intermediate' || value === 'medium') return 'moderate'
+  return QUIZ_DIFFICULTIES.includes(value as QuizDifficulty)
+    ? (value as QuizDifficulty)
+    : undefined
+}
+
+/** Question shape returned by the backend quiz generator. */
+interface RawQuizQuestion {
+  id?: string
+  prompt?: string
+  options?: unknown
+  correctIndex?: unknown
+  explanation?: string
+  concept?: string
+  difficulty?: string
+}
+
+export interface GenerateTopicQuizInput {
+  topic: string
+  level?: string
+  /** Number of questions to request (6-60, defaults to 30). */
+  count?: number
+  /** Weak concepts to focus a retest on. */
+  concepts?: string[]
+}
+
+export type GenerateTopicQuizOutput =
+  | { state: 'ready'; quiz: Quiz }
+  | { state: 'error'; message: string; blocked?: boolean }
+
+const GENERATE_QUIZ_API = apiUrl('/api/ai/generate-quiz')
+
+/**
+ * Generate a validated topic quiz with 30+ multiple-choice questions
+ * (10 basic / 10 moderate / 10 advanced by default), ordered easiest
+ * first. The backend runs SafeSearch, Groq generation, de-duplication and
+ * validation. Never throws and never touches the API key.
+ */
+export async function generateTopicQuiz(
+  input: GenerateTopicQuizInput,
+): Promise<GenerateTopicQuizOutput> {
+  const topic = (input.topic || '').trim().slice(0, 200)
+  if (!topic) {
+    return { state: 'error', message: 'Enter a topic to generate a quiz.' }
+  }
+
+  const rawCount = Number(input.count)
+  const count = Number.isFinite(rawCount) && rawCount > 0 ? Math.min(Math.max(Math.round(rawCount), 6), 60) : 30
+  const concepts = (input.concepts || [])
+    .map((c) => String(c).trim())
+    .filter(Boolean)
+    .slice(0, 12)
+
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), 180000)
+  try {
+    const res = await fetch(GENERATE_QUIZ_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        topic,
+        level: (input.level || 'beginner').slice(0, 20),
+        count,
+        concepts,
+      }),
+      signal: controller.signal,
+    })
+    const data = (await res.json().catch(() => null)) as
+      | { quiz?: { questions?: RawQuizQuestion[] }; error?: string }
+      | null
+      | undefined
+    if (res.status === 422) {
+      return {
+        state: 'error',
+        blocked: true,
+        message: data?.error || "This topic isn't available on FocusLearn.",
+      }
+    }
+    const rawQuestions = data?.quiz?.questions
+    if (!res.ok || !Array.isArray(rawQuestions) || rawQuestions.length === 0) {
+      return {
+        state: 'error',
+        message: data?.error || 'Unable to generate a quiz right now. Please try again.',
+      }
+    }
+
+    const questions: QuizQuestion[] = rawQuestions
+      .map((raw, index): QuizQuestion | null => {
+        const prompt = String(raw.prompt || '').trim()
+        const options = Array.isArray(raw.options) ? raw.options.map((o) => String(o)) : []
+        const correctIndex = Number(raw.correctIndex)
+        if (
+          !prompt ||
+          options.length < 2 ||
+          !Number.isInteger(correctIndex) ||
+          correctIndex < 0 ||
+          correctIndex >= options.length
+        ) {
+          return null
+        }
+        const difficulty = normalizeDifficulty(raw.difficulty)
+        return {
+          id: raw.id || `q${index + 1}`,
+          prompt,
+          options,
+          correctIndex,
+          explanation: String(raw.explanation || '').trim(),
+          concept: raw.concept ? String(raw.concept).trim() : undefined,
+          difficulty,
+        }
+      })
+      .filter((q): q is QuizQuestion => q !== null)
+
+    if (questions.length === 0) {
+      return {
+        state: 'error',
+        message: 'Unable to generate a quiz right now. Please try again.',
+      }
+    }
+
+    const normalized = normalizeTopic(topic)
+    const slug = topicHaystack(normalized).replace(/\s/g, '-')
+    return {
+      state: 'ready',
+      quiz: {
+        id: `quiz-topic-${slug}`,
+        lessonId: `topic-${slug}`,
+        title: `${normalized} — Check`,
+        source: 'topic',
+        topic: normalized,
+        level: (input.level || 'beginner').slice(0, 20),
+        questions,
+      },
+    }
+  } catch {
+    return {
+      state: 'error',
+      message: 'Unable to generate a quiz right now. Please try again.',
     }
   } finally {
     window.clearTimeout(timer)

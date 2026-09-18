@@ -1,19 +1,34 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { Quiz, QuizQuestion } from '../types'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { QuizDifficulty, QuizQuestion, Roadmap } from '../types'
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { AppLayout } from '../components/AppLayout'
 import { useApp } from '../context/AppContext'
-import { quizzes } from '../data/student'
+import { topicQuizLessonId } from '../services/goalProgress'
 import {
-  generateQuiz as generateQuizMock,
-  getTopicQuiz,
-  normalizeTopic,
   analyzeQuizPerformance,
+  normalizeTopic,
   type AnalyzePerformanceInput,
+  type PerformanceAnalysisResult,
 } from '../services/aiService'
+import {
+  answerQuiz,
+  getQuiz,
+  getQuizStatus,
+  prepareQuiz,
+  submitQuiz,
+  QUIZ_TIER_ORDER,
+  TopicQuizError,
+} from '../services/topicQuiz'
+import type {
+  AnswerFeedback,
+  Quiz,
+  TopicQuizStatus,
+  TopicQuizSubmission,
+} from '../types'
 import {
   IconArrowRight,
   IconCheck,
+  IconLock,
   IconQuiz,
   IconSparkles,
   IconTarget,
@@ -21,74 +36,471 @@ import {
   IconX,
 } from '../components/Icons'
 
-type Phase = 'intro' | 'question' | 'result' | 'analyzing'
+type Phase = 'intro' | 'question' | 'result'
+
+type TopicStatus = 'preparing' | 'error' | 'intro' | 'question' | 'result'
+
+interface AnalysisState {
+  status: 'idle' | 'loading' | 'ready' | 'error'
+  analysis?: PerformanceAnalysisResult['analysis']
+  message?: string
+}
+
+/** One server-recorded answer, keyed by question index. */
+interface AnsweredQuestion {
+  selected: number
+  correct: boolean
+}
+
+const DIFFICULTY_LABEL: Record<QuizDifficulty, string> = {
+  basic: 'Basic',
+  moderate: 'Moderate',
+  advanced: 'Advanced',
+}
+
+function statusMessage(pct: number): string {
+  if (pct >= 80) return 'Strong understanding — you can move forward confidently.'
+  if (pct >= 60) return 'Good effort — review the explanations below and try a focused retest.'
+  return 'Keep going — work through the review below, then retest your weak concepts.'
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => window.setTimeout(r, ms))
+}
+
+/** Poll a quiz id until the validated quiz is READY (or it fails/timeouts). */
+async function awaitQuiz(quizId: string, timeoutMs = 300000): Promise<import('../types').Quiz> {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    if (Date.now() > end) {
+      throw new TopicQuizError('Your quiz took too long to prepare. Please try again.', 0)
+    }
+    try {
+      return await getQuiz(quizId)
+    } catch (err) {
+      if (err instanceof TopicQuizError && err.status === 409 && Date.now() + 2500 <= end) {
+        await sleep(2500)
+        continue
+      }
+      throw err
+    }
+  }
+}
+
+function lockedTierFor(difficulty: QuizDifficulty | undefined, unlocked: Record<QuizDifficulty, boolean>): QuizDifficulty | null {
+  if (!difficulty) return null
+  if (unlocked[difficulty]) return null
+  return difficulty
+}
+
+/** A targeted retest has no tier gating — every question is in play. */
+function makeRetestStatus(quiz: Quiz, quizId: string, topic: string): TopicQuizStatus {
+  const difficulty_counts: Record<QuizDifficulty, number> = { basic: 0, moderate: 0, advanced: 0 }
+  for (const q of quiz.questions) {
+    if (q.difficulty) difficulty_counts[q.difficulty] += 1
+  }
+  return {
+    quiz_id: quizId,
+    topic,
+    lesson_id: quiz.lesson_id || quiz.lessonId,
+    state: 'ready',
+    error: null,
+    total: quiz.questions.length,
+    question_count: quiz.questions.length,
+    retest_of: quiz.retest_of || null,
+    focus_concepts: quiz.focus_concepts || [],
+    completed: false,
+    attempts: { basic: 0, moderate: 0, advanced: 0 },
+    unlocked: { basic: true, moderate: true, advanced: true },
+    difficulty_counts,
+    answers: [],
+    retest_ready: false,
+  }
+}
+
+/**
+ * Resolve a lesson id to the topic its 30-question quiz is keyed by.
+ * - `topic-<slug>` ids (server-driven quizzes) map straight back.
+ * - Catalog lesson ids (e.g. `web-dev-1-1`) resolve through the current
+ *   roadmap's lesson titles, so the roadmap "Take Quiz" flow always opens
+ *   the new server-driven 10/10/10 quiz for that lesson's topic.
+ * Returns null when the lesson is unknown.
+ */
+function lessonTopicName(lessonId: string | undefined, roadmap: Roadmap | null): string | null {
+  if (!lessonId) return null
+  if (lessonId.startsWith('topic-')) {
+    const name = lessonId.slice('topic-'.length).replace(/-+/g, ' ').trim()
+    return name || null
+  }
+  if (roadmap) {
+    for (const step of roadmap.steps) {
+      for (const lesson of step.lessons) {
+        if (lesson.id === lessonId) return lesson.title
+      }
+    }
+  }
+  return null
+}
 
 export default function Quiz() {
   const { lessonId, topic } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const { roadmap, recordAttempt, attempts } = useApp()
 
-  // Topic quiz (from Focus Mode) — generated for ANY searched topic via
-  // generateQuiz(currentTopic). Falls back to the sync mock on failure so
-  // the quiz never breaks.
-  const topicName = topic ? normalizeTopic(topic) : null
-  const [topicQuiz, setTopicQuiz] = useState<Quiz | undefined>(
-    topicName ? getTopicQuiz(topicName) : undefined,
-  )
+  // A topic quiz (from Focus Mode / AI roadmap / roadmap lesson "Take Quiz")
+  // is server-driven with progressive difficulty unlocking. Lesson routes
+  // resolve to their roadmap topic so they open the same 30-question quiz.
+  const resolvedLessonTopic = topic ? null : lessonTopicName(lessonId, roadmap)
+  const topicName = topic ? normalizeTopic(topic) : resolvedLessonTopic ? normalizeTopic(resolvedLessonTopic) : null
+  const isTopicQuiz = Boolean(topicName)
+
+  const [phase, setPhase] = useState<Phase>('intro')
+  const [qIndex, setQIndex] = useState(0)
+  const [result, setResult] = useState<{ submission: TopicQuizSubmission } | null>(null)
+  const [analysis, setAnalysis] = useState<AnalysisState>({ status: 'idle' })
+
+  // Topic quiz state (server-authoritative).
+  const [topicStatus, setTopicStatus] = useState<TopicStatus>('intro')
+  const [topicError, setTopicError] = useState('')
+  const [topicBlocked, setTopicBlocked] = useState(false)
+  const [serverStatus, setServerStatus] = useState<TopicQuizStatus | null>(null)
+  const [topicQuiz, setTopicQuiz] = useState<import('../types').Quiz | null>(null)
+  const [quizId, setQuizId] = useState<string | null>(null)
+  const [answered, setAnswered] = useState<Record<number, AnsweredQuestion>>({})
+  const [selected, setSelected] = useState<(number | null)[]>([])
+  const [submitting, setSubmitting] = useState(false)
+  const [retesting, setRetesting] = useState(false)
+  const [activeTier, setActiveTier] = useState<QuizDifficulty | null>(null)
+  const mountedRef = useRef(true)
+
+  // Load / regenerate the AI topic quiz for the current topic. The backend
+  // generates in the background; we poll the one quiz row until READY.
   useEffect(() => {
     if (!topicName) return
-    let cancelled = false
-    generateQuizMock(topicName)
-      .then((q) => {
-        if (!cancelled) setTopicQuiz(q)
-      })
-      .catch(() => {
-        if (!cancelled) setTopicQuiz(getTopicQuiz(topicName))
-      })
+    mountedRef.current = true
+    setTopicStatus('preparing')
+    setTopicError('')
+    setTopicBlocked(false)
+    setServerStatus(null)
+    setTopicQuiz(null)
+    setQuizId(null)
+    setAnswered({})
+    setSelected([])
+    setResult(null)
+    setAnalysis({ status: 'idle' })
+    setPhase('intro')
+    setQIndex(0)
+    setActiveTier(null)
+
+    const retestRequested = Boolean(location.state && (location.state as { retest?: boolean }).retest)
+
+    ;(async () => {
+      try {
+        // Retests are keyed by their parent quiz id; the weak concepts are
+        // already stored on the retest row, so we only need to know the
+        // primary quiz id (if any) to start the targeted retest.
+        let parentId: string | undefined
+        if (retestRequested) {
+          const initial = await getQuizStatus(topicName)
+          if (initial.quiz_id) parentId = initial.quiz_id
+        }
+        const prep = await prepareQuiz({
+          topic: topicName,
+          level: 'beginner',
+          quizId: parentId,
+        })
+        if (!mountedRef.current) return
+        const quiz = await awaitQuiz(prep.quiz_id)
+        if (!mountedRef.current) return
+        setQuizId(prep.quiz_id)
+        setTopicQuiz(quiz)
+        setSelected(Array(quiz.questions.length).fill(null))
+
+        if (!retestRequested) {
+          const status = await getQuizStatus(topicName)
+          if (!mountedRef.current) return
+          setServerStatus(status)
+          const restored: Record<number, AnsweredQuestion> = {}
+          for (const a of status.answers) {
+            restored[a.index] = { selected: a.selected_index, correct: a.is_correct }
+          }
+          setAnswered(restored)
+          if (status.completed) {
+            const sub = await submitQuiz(prep.quiz_id)
+            if (!mountedRef.current) return
+            setResult({ submission: sub })
+            setTopicStatus('result')
+            recordAttempt({
+              lessonId: status.lesson_id,
+              score: sub.score,
+              total: sub.total,
+              percentage: sub.percentage,
+              missedQuestionIds: quiz.questions
+                .filter((_, i) => restored[i] && !restored[i].correct)
+                .map((q) => q.id),
+              difficultyBreakdown: sub.breakdown,
+              weakConcepts: sub.weak_concepts.length > 0 ? sub.weak_concepts : undefined,
+              topicName: topicName ?? undefined,
+            })
+            void runAnalysis(quiz, restored, sub.score)
+          } else {
+            setTopicStatus('intro')
+          }
+        } else {
+          // Targeted retest: every question is in play, no gating.
+          setServerStatus(makeRetestStatus(quiz, prep.quiz_id, topicName))
+          setTopicStatus('intro')
+        }
+      } catch (err) {
+        if (!mountedRef.current) return
+        if (err instanceof TopicQuizError && err.blocked) {
+          setTopicBlocked(true)
+          setTopicError(err.message)
+        } else {
+          setTopicError(err instanceof TopicQuizError ? err.message : 'Something went wrong. Please try again.')
+        }
+        setTopicStatus('error')
+      }
+    })()
+
     return () => {
-      cancelled = true
+      mountedRef.current = false
     }
   }, [topicName])
 
-  const quiz = lessonId ? quizzes[lessonId] : topicQuiz
+  async function runAnalysis(
+    quiz: import('../types').Quiz,
+    answers: Record<number, AnsweredQuestion>,
+    finalScore: number,
+  ) {
+    setAnalysis({ status: 'loading' })
+    const conceptQuestions: AnalyzePerformanceInput['questions'] = quiz.questions.map(
+      (q: QuizQuestion) => ({
+        prompt: q.prompt,
+        options: q.options,
+        correctIndex: q.correctIndex,
+        concept: q.concept || q.prompt.slice(0, 30),
+        difficulty: q.difficulty,
+      }),
+    )
+    const answersList = quiz.questions.map((_, i) => {
+      const a = answers[i]
+      return a ? a.selected : -1
+    })
+    const res = await analyzeQuizPerformance({
+      roadmap_topic: quiz.topic || quiz.title,
+      quiz_score: finalScore,
+      total_questions: quiz.questions.length,
+      questions: conceptQuestions,
+      answers: answersList,
+      correct_answers: quiz.questions.map((q) => q.correctIndex),
+    })
+    if (!mountedRef.current) return
+    if (res.state === 'ready') {
+      setAnalysis({ status: 'ready', analysis: res.analysis })
+    } else {
+      setAnalysis({ status: 'error', message: res.message })
+    }
+  }
 
-  // Quiz hub when no lesson id is given.
+  function resetRun() {
+    if (!topicQuiz || !quizId) return
+    setPhase('intro')
+    setQIndex(0)
+    setAnswered({})
+    setSelected(Array(topicQuiz.questions.length).fill(null))
+    setResult(null)
+    setAnalysis({ status: 'idle' })
+    setActiveTier(null)
+  }
+
+  async function submitAnswer(savedSelected: number) {
+    if (!quizId || submitting) return
+    setSubmitting(true)
+    try {
+      const fb: AnswerFeedback = await answerQuiz(quizId, qIndex, savedSelected)
+      setAnswered((prev) => ({
+        ...prev,
+        [qIndex]: { selected: fb.selected_index, correct: fb.is_correct },
+      }))
+      setServerStatus((prev) =>
+        prev
+          ? { ...prev, attempts: fb.attempts, unlocked: fb.unlocked, completed: fb.completed }
+          : prev,
+      )
+    } catch (err) {
+      setTopicError(err instanceof TopicQuizError ? err.message : 'Could not save your answer.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function finishQuiz() {
+    if (!quizId || !topicQuiz || !serverStatus) return
+    setSubmitting(true)
+    try {
+      const sub = await submitQuiz(quizId)
+      const liveAnswered = answered
+      setResult({ submission: sub })
+      setTopicStatus('result')
+      recordAttempt({
+        lessonId: serverStatus.lesson_id,
+        score: sub.score,
+        total: sub.total,
+        percentage: sub.percentage,
+        missedQuestionIds: topicQuiz.questions
+          .filter((_, i) => liveAnswered[i] && !liveAnswered[i].correct)
+          .map((q) => q.id),
+        difficultyBreakdown: sub.breakdown,
+        weakConcepts: sub.weak_concepts.length > 0 ? sub.weak_concepts : undefined,
+        topicName: topicName ?? undefined,
+      })
+      void runAnalysis(topicQuiz, liveAnswered, sub.score)
+    } catch (err) {
+      setTopicError(err instanceof TopicQuizError ? err.message : 'Could not submit your quiz.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  async function retest() {
+    if (!topicName || !topicQuiz || !result || !quizId) return
+    setRetesting(true)
+    setTopicStatus('preparing')
+    setTopicError('')
+    try {
+      const weak = result.submission.weak_concepts
+      const prep = await prepareQuiz({
+        topic: topicName,
+        level: 'beginner',
+        quizId,
+        concepts: weak,
+      })
+      const quiz = await awaitQuiz(prep.quiz_id)
+      if (!mountedRef.current) return
+      setQuizId(prep.quiz_id)
+      setTopicQuiz(quiz)
+      setServerStatus(makeRetestStatus(quiz, prep.quiz_id, topicName))
+      setAnswered({})
+      setSelected(Array(quiz.questions.length).fill(null))
+      setResult(null)
+      setAnalysis({ status: 'idle' })
+      setPhase('intro')
+      setQIndex(0)
+      setTopicStatus('intro')
+      setActiveTier(null)
+    } catch (err) {
+      if (!mountedRef.current) return
+      setTopicError(err instanceof TopicQuizError ? err.message : 'Could not prepare your retest.')
+      setTopicStatus('error')
+    } finally {
+      setRetesting(false)
+    }
+  }
+
+  function retryGenerate() {
+    if (!topicName) return
+    setTopicStatus('preparing')
+    setTopicError('')
+    setTopicBlocked(false)
+    ;(async () => {
+      try {
+        const prep = await prepareQuiz({ topic: topicName, level: 'beginner' })
+        const quiz = await awaitQuiz(prep.quiz_id)
+        if (!mountedRef.current) return
+        setQuizId(prep.quiz_id)
+        setTopicQuiz(quiz)
+        const status = await getQuizStatus(topicName)
+        if (!mountedRef.current) return
+        setServerStatus(status)
+        setSelected(Array(quiz.questions.length).fill(null))
+        setAnswered({})
+        setTopicStatus('intro')
+      } catch (err) {
+        if (!mountedRef.current) return
+        setTopicError(err instanceof TopicQuizError ? err.message : 'Something went wrong. Please try again.')
+        setTopicBlocked(err instanceof TopicQuizError && err.blocked)
+        setTopicStatus('error')
+      }
+    })()
+  }
+
+  // Quiz hub when no lesson id or topic is given: every roadmap lesson has
+  // an on-demand 30-question topic quiz (10 basic / 10 moderate / 10 advanced).
   const availableQuizzes = useMemo(() => {
     if (!roadmap) return []
     const out: { lessonId: string; title: string; stepTitle: string; done: boolean }[] = []
     for (const step of roadmap.steps) {
       for (const lesson of step.lessons) {
-        if (lesson.id in quizzes) {
-          out.push({
-            lessonId: lesson.id,
-            title: lesson.title,
-            stepTitle: step.title,
-            done: attempts.some((a) => a.lessonId === lesson.id),
-          })
-        }
+        const attemptLessonId = topicQuizLessonId(lesson.title)
+        out.push({
+          lessonId: lesson.id,
+          title: lesson.title,
+          stepTitle: step.title,
+          done: attempts.some((a) => a.lessonId === attemptLessonId),
+        })
       }
     }
     return out
   }, [roadmap, attempts])
 
-  const [phase, setPhase] = useState<Phase>('intro')
-  const [qIndex, setQIndex] = useState(0)
-  const [selected, setSelected] = useState<number | null>(null)
-  const [answered, setAnswered] = useState(false)
-  const [score, setScore] = useState(0)
-  const [missed, setMissed] = useState<string[]>([])
-  // Track every answer (selected index) and the correct answer for AI analysis
-  const [allAnswers, setAllAnswers] = useState<number[]>([])
-  const [allCorrectAnswers, setAllCorrectAnswers] = useState<number[]>([])
-  const [analysisError, setAnalysisError] = useState<string | null>(null)
+  /* ── Loading / error while preparing a topic quiz ───────────────── */
+  if (isTopicQuiz && !topicQuiz) {
+    if (topicStatus === 'error') {
+      return (
+        <AppLayout>
+          <div className="page page-narrow">
+            <div className="card text-center" style={{ padding: '2.2rem 1.5rem' }}>
+              <span className="badge badge-muted" style={{ marginBottom: '0.8rem' }}>
+                <IconQuiz size={13} />
+                {topicName}
+              </span>
+              <h1 style={{ fontSize: '1.35rem' }}>Quiz unavailable</h1>
+              <p className="muted mt-1">{topicError}</p>
+              <div className="row wrap" style={{ justifyContent: 'center', marginTop: '1.2rem' }}>
+                <button className="btn btn-primary" onClick={retryGenerate}>
+                  Try Again
+                  <IconArrowRight size={16} />
+                </button>
+                <Link to="/search" className="btn btn-ghost">
+                  Back to search
+                </Link>
+              </div>
+              {topicBlocked && (
+                <p className="faint small mt-2">
+                  This topic was flagged by content safety. Try a different topic.
+                </p>
+              )}
+            </div>
+          </div>
+        </AppLayout>
+      )
+    }
+    return (
+      <AppLayout>
+        <div className="page page-narrow">
+          <div className="card text-center" style={{ padding: '3rem 1.5rem' }}>
+            <span className="spinner" style={{ width: 32, height: 32, margin: '0 auto 1rem' }} />
+            <h2 style={{ fontSize: '1.2rem' }}>
+              {retesting ? 'Preparing your retest…' : 'Preparing your quiz…'}
+            </h2>
+            <p className="muted mt-1">
+              Writing 30 questions on "{topicName}" across basic, moderate and advanced.
+            </p>
+          </div>
+        </div>
+      </AppLayout>
+    )
+  }
 
-  if ((!lessonId && !topicQuiz) || !quiz) {
+  if (!topicQuiz && !lessonId) {
     return (
       <AppLayout>
         <div className="page">
           <div className="page-header">
-            <h1>Understanding Checks</h1>
-            <p>Short quizzes that test real understanding after each lesson.</p>
+            <h1>Topic Quizzes</h1>
+            <p>30-question assessments after each lesson — basic, moderate and advanced.</p>
           </div>
           {availableQuizzes.length > 0 ? (
             <div className="grid-auto">
@@ -96,14 +508,14 @@ export default function Quiz() {
                 <div
                   key={q.lessonId}
                   className="card card-hover"
-                  onClick={() => navigate(`/quiz/${q.lessonId}`)}
+                  onClick={() => navigate(`/quiz/topic/${encodeURIComponent(q.title)}`)}
                 >
                   <div className="row-between mb-1">
                     <span className="badge badge-primary">{q.stepTitle}</span>
                     {q.done && <span className="badge badge-success">Attempted</span>}
                   </div>
                   <h3 className="card-title">{q.title}</h3>
-                  <p className="card-desc">2 questions · quick understanding check</p>
+                  <p className="card-desc">30 questions · Basic · Moderate · Advanced</p>
                   <div className="row-between mt-2">
                     <span className="row small muted">
                       <IconQuiz size={15} />
@@ -132,194 +544,224 @@ export default function Quiz() {
     )
   }
 
-  const question = quiz.questions[qIndex]
-  const total = quiz.questions.length
-
-  function start() {
-    setPhase('question')
-    setQIndex(0)
-    setSelected(null)
-    setAnswered(false)
-    setScore(0)
-    setMissed([])
-    setAllAnswers([])
-    setAllCorrectAnswers([])
-    setAnalysisError(null)
-  }
-
-  function choose(i: number) {
-    if (answered) return
-    setSelected(i)
-    setAnswered(true)
-    if (i === question.correctIndex) {
-      setScore((s) => s + 1)
-    } else {
-      setMissed((m) => [...m, question.id])
-    }
-  }
-
-  function nextQuestion() {
-    // Record this answer
-    const newAnswers = [...allAnswers, selected ?? -1]
-    const newCorrect = [...allCorrectAnswers, question.correctIndex]
-    setAllAnswers(newAnswers)
-    setAllCorrectAnswers(newCorrect)
-
-    if (qIndex + 1 < total) {
-      setQIndex((i) => i + 1)
-      setSelected(null)
-      setAnswered(false)
-    } else {
-      // Quiz complete — record attempt and start AI analysis
-      const finalScore = selected === question.correctIndex ? score + 1 : score
-      const finalMissed = selected === question.correctIndex ? missed : [...missed, question.id]
-      const pct = Math.round((finalScore / total) * 100)
-
-      recordAttempt({
-        lessonId: quiz!.lessonId,
-        score: finalScore,
-        total,
-        percentage: pct,
-        missedQuestionIds: finalMissed,
-      })
-
-      // If this is a topic quiz (from AI roadmap), run AI analysis
-      if (topicName && quiz!.lessonId.startsWith('topic-')) {
-        setPhase('analyzing')
-        runAiAnalysis(newAnswers, newCorrect, finalScore, total)
-      } else {
-        setPhase('result')
-      }
-    }
-  }
-
-  async function runAiAnalysis(
-    answers: number[],
-    correctAnswers: number[],
-    finalScore: number,
-    totalQ: number,
-  ) {
-    const conceptQuestions: AnalyzePerformanceInput['questions'] = quiz!.questions.map(
-      (q: QuizQuestion) => ({
-        prompt: q.prompt,
-        options: q.options,
-        correctIndex: q.correctIndex,
-        concept: q.concept || q.prompt.slice(0, 30),
-      }),
-    )
-
-    const result = await analyzeQuizPerformance({
-      roadmap_topic: topicName!,
-      quiz_score: finalScore,
-      total_questions: totalQ,
-      questions: conceptQuestions,
-      answers,
-      correct_answers: correctAnswers,
-    })
-
-    if (result.state === 'ready') {
-      // Navigate back to AI roadmap with analysis results
-      navigate('/ai-roadmap', {
-        state: {
-          analysis: result.analysis,
-          topicName: topicName,
-          quizScore: finalScore,
-          quizTotal: totalQ,
-        },
-      })
-    } else {
-      // AI analysis failed — fall back to basic result display
-      setAnalysisError(result.message)
-      setPhase('result')
-    }
-  }
-
-  if (phase === 'intro') {
-    return (
-      <AppLayout>
-        <div className="page page-narrow">
-          <div className="card text-center" style={{ padding: '2.2rem 1.5rem' }}>
-            <span className="badge badge-primary" style={{ marginBottom: '0.8rem' }}>
-              <IconQuiz size={13} />
-              Understanding check
-            </span>
-            <h1 style={{ fontSize: '1.5rem' }}>{quiz.title}</h1>
-            <p className="muted mt-1">
-              {total} questions · quick check on "{quiz.title.replace(' — Check', '')}"
-            </p>
-            {topicName && (
-              <span className="badge badge-focus" style={{ marginTop: '0.6rem' }}>
-                Generated for your Focus Mode topic: {topicName}
-              </span>
-            )}
-            <button className="btn btn-primary btn-lg mt-2" onClick={start}>
-              Start Quiz
-              <IconArrowRight size={17} />
-            </button>
-            <div className="mt-2">
-              <Link to="/quiz" className="btn btn-ghost">
-                All quizzes
-              </Link>
-            </div>
-          </div>
-        </div>
-      </AppLayout>
-    )
-  }
-
-  if (phase === 'analyzing') {
+  // Legacy lesson routes that do not resolve to a roadmap topic. The old
+  // 2-question "understanding check" catalog was removed — the new system
+  // always serves the server-generated 30-question topic quiz instead.
+  if (!isTopicQuiz && lessonId) {
     return (
       <AppLayout>
         <div className="page page-narrow">
           <div className="card text-center" style={{ padding: '3rem 1.5rem' }}>
-            <span className="spinner" style={{ width: 32, height: 32, margin: '0 auto 1rem' }} />
-            <h2 style={{ fontSize: '1.2rem' }}>AI is analyzing your performance...</h2>
-            <p className="muted mt-1">
-              Identifying your strong and weak concepts to create a personalized study plan.
-            </p>
+            <h1>Quiz not found</h1>
+            <p className="muted mt-1">This lesson isn't part of the current roadmap.</p>
+            <Link to="/quiz" className="btn btn-primary mt-2">Back to all quizzes</Link>
           </div>
         </div>
       </AppLayout>
     )
   }
 
-  if (phase === 'result') {
-    const pct = Math.round((score / total) * 100)
+  /* ── Topic quiz (server-driven progressive unlock) ─────────────── */
+  if (!topicQuiz || !serverStatus) {
+    return null
+  }
+  const questions = topicQuiz.questions
+  const total = questions.length
+  const unlocked = serverStatus.unlocked
+  const attemptsCount = serverStatus.attempts
+  const answeredCount = Object.keys(answered).length
+  const question = questions[qIndex] as (QuizQuestion & { difficulty?: QuizDifficulty }) | undefined
+
+  // Tier boundaries — questions are stored ordered Basic → Moderate → Advanced.
+  const tierBounds: Record<QuizDifficulty, { start: number; end: number }> = {
+    basic: { start: 0, end: 0 },
+    moderate: { start: 0, end: 0 },
+    advanced: { start: 0, end: 0 },
+  }
+  {
+    let start = 0
+    for (const d of QUIZ_TIER_ORDER) {
+      let count = 0
+      for (let i = start; i < questions.length; i += 1) {
+        if (questions[i].difficulty !== d) break
+        count += 1
+      }
+      tierBounds[d] = { start, end: start + count }
+      start += count
+    }
+  }
+  const tierCount = (d: QuizDifficulty) => tierBounds[d].end - tierBounds[d].start
+  const tierProgress = (d: QuizDifficulty) => {
+    const { start, end } = tierBounds[d]
+    let n = 0
+    for (let i = start; i < end; i += 1) {
+      if (answered[i]) n += 1
+    }
+    return n
+  }
+
+  function startTier(d: QuizDifficulty) {
+    if (!unlocked[d]) return
+    const { start, end } = tierBounds[d]
+    let target = start
+    for (let i = start; i < end; i += 1) {
+      if (!answered[i]) {
+        target = i
+        break
+      }
+    }
+    setActiveTier(d)
+    setQIndex(Math.min(target, Math.max(start, end - 1)))
+    setPhase('question')
+  }
+
+  const renderLockedTier = () => {
+    if (!question) return null
+    const tier = lockedTierFor(question.difficulty, unlocked)
+    if (!tier) return null
+    const message =
+      tier === 'moderate'
+        ? `Attempt 3 Basic questions to unlock (${Math.min(3, attemptsCount.basic)}/3 answered)`
+        : `Attempt 3 Moderate questions to unlock (${Math.min(3, attemptsCount.moderate)}/3 answered)`
+    return (
+      <div className="quiz-lock-card">
+        <IconLock size={20} />
+        <div>
+          <strong>{DIFFICULTY_LABEL[tier]} locked</strong>
+          <p className="small muted">{message}</p>
+        </div>
+      </div>
+    )
+  }
+
+  /* Result phase (topic quiz) */
+  if (phase === 'result' && result) {
+    const pct = result.submission.percentage
+    const statusTone = pct >= 80 ? 'pass' : pct >= 60 ? 'practice' : 'review'
+    const review = questions.map((q, i) => {
+      const a = answered[i]
+      const wasAnswered = Boolean(a)
+      const correct = Boolean(a && a.correct)
+      return { q, i, wasAnswered, correct }
+    })
+    const incorrectCount = review.filter((r) => r.wasAnswered && !r.correct).length
+    const skippedCount = review.filter((r) => !r.wasAnswered).length
+
+    const goToTier = (d: QuizDifficulty) => {
+      startTier(d)
+    }
+
     return (
       <AppLayout>
         <div className="page page-narrow">
-          <div className="card text-center" style={{ padding: '2.2rem 1.5rem' }}>
-            <div
-              style={{
-                width: 72,
-                height: 72,
-                borderRadius: '50%',
-                margin: '0 auto 1rem',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                background: pct >= 80 ? 'var(--success-soft)' : 'var(--warning-soft)',
-                color: pct >= 80 ? 'var(--success)' : 'var(--warning)',
-              }}
-            >
+          <div className={`card text-center quiz-result-card ${statusTone}`} style={{ padding: '2.2rem 1.5rem' }}>
+            <div className={`quiz-result-medal ${statusTone}`}>
               <IconTrend size={30} />
             </div>
             <h1 style={{ fontSize: '1.5rem' }}>
-              {score} / {total} correct
+              {result.submission.score} / {result.submission.total} correct
             </h1>
-            <p className="muted mt-1">
-              {pct >= 80
-                ? 'Strong understanding — you can move forward confidently.'
-                : 'Good effort — review the explanations below and try again.'}
-            </p>
-            {analysisError && (
-              <div className="banner banner-warning mt-2" style={{ textAlign: 'left' }}>
-                <IconSparkles size={16} />
-                <span>AI analysis unavailable: {analysisError}. Showing basic results.</span>
+            <p className="quiz-result-percent">{pct}%</p>
+            <p className="muted mt-1">{statusMessage(pct)}</p>
+
+            <div className="quiz-result-counts mt-2">
+              <span className="quiz-count-pill success">
+                <IconCheck size={13} /> {result.submission.score} correct
+              </span>
+              {incorrectCount > 0 && (
+                <span className="quiz-count-pill danger">
+                  <IconX size={13} /> {incorrectCount} incorrect
+                </span>
+              )}
+              {skippedCount > 0 && (
+                <span className="quiz-count-pill muted">{skippedCount} skipped</span>
+              )}
+            </div>
+
+            <div className="quiz-breakdown mt-2">
+              {QUIZ_TIER_ORDER.map((d) => {
+                const tier = result.submission.breakdown[d]
+                if (tier.total === 0) return null
+                const tierPct = Math.round((tier.correct / tier.total) * 100)
+                return (
+                  <div key={d} className="quiz-breakdown-row">
+                    <span className={`quiz-difficulty-badge ${d}`}>{DIFFICULTY_LABEL[d]}</span>
+                    <div className="quiz-breakdown-track">
+                      <div className={`quiz-breakdown-fill ${d}`} style={{ width: `${tierPct}%` }} />
+                    </div>
+                    <span className="small muted" style={{ whiteSpace: 'nowrap' }}>
+                      {tier.correct}/{tier.total}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+
+            <div className="quiz-unlock-progress mt-2">
+              {QUIZ_TIER_ORDER.map((d) => (
+                <button
+                  key={d}
+                  type="button"
+                  className="quiz-tier-pill"
+                  onClick={() => goToTier(d)}
+                >
+                  {unlocked[d] ? <IconCheck size={12} /> : <IconLock size={12} />}
+                  {DIFFICULTY_LABEL[d]}
+                </button>
+              ))}
+            </div>
+
+            {analysis.status !== 'idle' && (
+              <div className="quiz-analysis-inline mt-2">
+                {analysis.status === 'loading' && (
+                  <span className="row small muted" style={{ justifyContent: 'center', gap: '0.5rem' }}>
+                    <span className="spinner" style={{ width: 14, height: 14 }} />
+                    AI is analyzing your strengths and weak concepts…
+                  </span>
+                )}
+                {analysis.status === 'error' && (
+                  <span className="small muted">AI analysis unavailable: {analysis.message}</span>
+                )}
+                {analysis.status === 'ready' && analysis.analysis && (
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() =>
+                      navigate('/ai-roadmap', {
+                        state: {
+                          analysis: analysis.analysis,
+                          topicName,
+                          quizScore: result.submission.score,
+                          quizTotal: result.submission.total,
+                        },
+                      })
+                    }
+                  >
+                    <IconSparkles size={16} />
+                    View AI Analysis &amp; Next Steps
+                  </button>
+                )}
               </div>
             )}
+
+            {result.submission.weak_concepts.length > 0 && (
+              <div className="mt-2">
+                <p className="small muted" style={{ marginBottom: '0.4rem' }}>
+                  Concepts to retest:
+                </p>
+                <div className="quiz-concept-chips">
+                  {result.submission.weak_concepts.map((c) => (
+                    <span key={c} className="quiz-chip">{c}</span>
+                  ))}
+                </div>
+                <button className="btn btn-primary mt-2" onClick={retest} disabled={retesting}>
+                  {retesting ? 'Preparing retest…' : 'Retest Weak Concepts'}
+                  {!retesting && <IconArrowRight size={16} />}
+                </button>
+              </div>
+            )}
+
             <div className="row wrap" style={{ justifyContent: 'center', marginTop: '1.2rem' }}>
-              <button className="btn btn-secondary" onClick={start}>
+              <button className="btn btn-secondary" onClick={resetRun}>
                 Retake
               </button>
               <Link to="/performance" className="btn btn-primary">
@@ -332,39 +774,197 @@ export default function Quiz() {
             </div>
           </div>
 
-          {missed.length > 0 && (
-            <div className="card mt-2">
-              <div className="row mb-1" style={{ color: 'var(--warning)' }}>
-                <IconSparkles size={18} />
-                <h2 style={{ fontSize: '1.05rem' }}>What to review</h2>
-              </div>
-              {quiz.questions
-                .filter((q) => missed.includes(q.id))
-                .map((q) => (
-                  <div key={q.id} className="list-row">
-                    <div style={{ minWidth: 0 }}>
-                      <div className="small" style={{ fontWeight: 600 }}>
-                        {q.prompt}
-                      </div>
-                      <div className="faint" style={{ fontSize: '0.82rem' }}>
-                        Correct answer: {q.options[q.correctIndex]}
-                      </div>
-                      {q.concept && (
-                        <div className="small" style={{ color: 'var(--primary)', marginTop: '0.2rem' }}>
-                          Concept: {q.concept}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ))}
+          <div className="card mt-2">
+            <div className="row mb-1" style={{ color: 'var(--primary)' }}>
+              <IconSparkles size={18} />
+              <h2 style={{ fontSize: '1.05rem' }}>Review every question</h2>
             </div>
-          )}
+            {review.map(({ q, i, wasAnswered, correct }) => (
+              <div key={q.id} className="quiz-review-item">
+                <div className="row-between wrap" style={{ gap: '0.4rem' }}>
+                  <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
+                    <span className="small" style={{ fontWeight: 600 }}>
+                      {i + 1}. {q.prompt}
+                    </span>
+                  </div>
+                  <div className="row" style={{ gap: '0.4rem' }}>
+                    {q.difficulty && (
+                      <span className={`quiz-difficulty-badge ${q.difficulty}`}>{q.difficulty}</span>
+                    )}
+                    <span className={`quiz-count-pill ${correct ? 'success' : wasAnswered ? 'danger' : 'muted'}`}>
+                      {correct ? <IconCheck size={12} /> : <IconX size={12} />}
+                      {correct ? 'Correct' : wasAnswered ? 'Incorrect' : 'Skipped'}
+                    </span>
+                  </div>
+                </div>
+                <div className="quiz-review-answer">
+                  <span className="faint small">
+                    Your answer:{' '}
+                    {wasAnswered ? q.options[answered[i].selected] ?? '—' : 'Not answered'}
+                  </span>
+                  <span className="small" style={{ color: 'var(--success)', fontWeight: 600 }}>
+                    Correct: {q.options[q.correctIndex]}
+                  </span>
+                </div>
+                {q.explanation && <p className="small muted">{q.explanation}</p>}
+                {q.concept && <span className="quiz-review-tag">Concept: {q.concept}</span>}
+              </div>
+            ))}
+          </div>
         </div>
       </AppLayout>
     )
   }
 
-  // Question phase
+  /* Intro phase (topic quiz) — tier overview: 30 Questions, one session per tier */
+  if (phase === 'intro') {
+    const answeredHere = Object.keys(answered).length
+    return (
+      <AppLayout>
+        <div className="page page-narrow">
+          <div className="card text-center" style={{ padding: '2.2rem 1.5rem' }}>
+            <span className="badge badge-primary" style={{ marginBottom: '0.8rem' }}>
+              <IconQuiz size={13} />
+              Topic quiz · 30 questions
+            </span>
+            <h1 style={{ fontSize: '1.5rem' }}>{topicName}</h1>
+            <p className="muted mt-1">{total} Questions</p>
+            {answeredHere > 0 && (
+              <p className="faint small mt-1">
+                {answeredHere}/{total} answered · {Math.round((answeredHere / total) * 100)}%
+              </p>
+            )}
+            {topicQuiz.retest_of && (
+              <span className="badge badge-focus" style={{ marginTop: '0.6rem' }}>
+                <IconSparkles size={12} />
+                Targeted retest of your weak concepts
+              </span>
+            )}
+            <div
+              className="col"
+              style={{
+                gap: '0.8rem',
+                marginTop: '1.2rem',
+                maxWidth: 520,
+                marginLeft: 'auto',
+                marginRight: 'auto',
+              }}
+            >
+              {QUIZ_TIER_ORDER.map((d) => {
+                const wins = unlocked[d]
+                const tierDone = tierProgress(d) >= tierCount(d)
+                const tierDoneCount = tierProgress(d)
+                return (
+                  <div key={d} className="topic-quiz-tier-row">
+                    <div className="quiz-tier-gate">
+                      <span className={`quiz-difficulty-badge ${d}`}>{DIFFICULTY_LABEL[d]}</span>
+                      <span className="quiz-tier-count-label">
+                        <strong>{tierCount(d)}</strong> Questions
+                        {tierDone && (
+                          <span className="quiz-tier-done">
+                            <IconCheck size={12} />
+                            Completed
+                          </span>
+                        )}
+                        {!tierDone && tierDoneCount > 0 && (
+                          <span className="faint small">
+                            {tierDoneCount}/{tierCount(d)} answered
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                    <div className="quiz-tier-action">
+                      {wins ? (
+                        <button
+                          className="btn btn-primary"
+                          onClick={() => startTier(d)}
+                          disabled={submitting}
+                        >
+                          {tierDoneCount > 0 ? 'Resume' : `Start ${DIFFICULTY_LABEL[d]} Quiz`}
+                          <IconArrowRight size={15} />
+                        </button>
+                      ) : (
+                        <div className="quiz-tier-locknote">
+                          <IconLock size={15} />
+                          <span>
+                            {d === 'moderate'
+                              ? 'Attempt 3 Basic questions to unlock'
+                              : 'Attempt 3 Moderate questions to unlock'}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <p className="faint small mt-2">
+              Answer any 3 Basic questions to unlock Moderate, then any 3 Moderate to unlock
+              Advanced. Correct and incorrect answers both count.
+            </p>
+            {answeredHere > 0 && (
+              <div className="mt-2">
+                <button className="btn btn-secondary" onClick={finishQuiz} disabled={submitting}>
+                  Finish &amp; See Results
+                  <IconTrend size={16} />
+                </button>
+              </div>
+            )}
+            <div className="mt-1">
+              <Link to="/quiz" className="btn btn-ghost">
+                All quizzes
+              </Link>
+            </div>
+          </div>
+        </div>
+      </AppLayout>
+    )
+  }
+
+  /* Question phase (topic quiz) — one difficulty session at a time */
+  const questionIndex = qIndex
+  const currentQ = question
+  if (!currentQ) {
+    return null
+  }
+  const active = (activeTier ?? currentQ.difficulty ?? 'basic') as QuizDifficulty
+  const { start: tierStart, end: tierEnd } = tierBounds[active]
+  const tierTotal = tierCount(active)
+  const questionInTier = questionIndex - tierStart
+  const answeredNow = answered[questionIndex]
+  const currentlySelected = selected[questionIndex]
+  const isLocked = !unlocked[active]
+  const atTierEnd = questionIndex >= tierEnd - 1
+  const tierDone = tierProgress(active)
+  const progress = tierTotal > 0 ? ((questionInTier + (answeredNow ? 1 : 0)) / tierTotal) * 100 : 0
+  const activeLabel = DIFFICULTY_LABEL[active]
+  const nextTier = QUIZ_TIER_ORDER[QUIZ_TIER_ORDER.indexOf(active) + 1] as QuizDifficulty | undefined
+  const nextUnlocked = Boolean(nextTier && unlocked[nextTier])
+
+  const goNext = () => {
+    const next = questionIndex + 1
+    if (next >= tierEnd || next >= total) return
+    setQIndex(next)
+  }
+
+  const goPrev = () => {
+    if (questionIndex > tierStart) setQIndex(questionIndex - 1)
+  }
+
+  const continueNext = () => {
+    if (nextTier && unlocked[nextTier]) startTier(nextTier)
+    else void finishQuiz()
+  }
+
+  const backToOverview = () => {
+    setActiveTier(null)
+    setPhase('intro')
+  }
+
+  const tierCommand = (d: QuizDifficulty) => {
+    if (unlocked[d]) startTier(d)
+  }
+
   return (
     <AppLayout>
       <div className="page">
@@ -375,89 +975,163 @@ export default function Quiz() {
               <div className="row" style={{ gap: '0.7rem', alignItems: 'center' }}>
                 <span className="quiz-step-pill">
                   <IconQuiz size={13} />
-                  Quick Quiz
+                  {activeLabel} Quiz
                 </span>
                 <span className="small muted">
-                  Question {qIndex + 1} of {total}
+                  Question {questionInTier + 1} of {tierTotal}
                 </span>
               </div>
-              <Link to="/quiz" className="btn btn-ghost">
-                Quit
-              </Link>
+              <div className="row" style={{ gap: '0.5rem' }}>
+                <button className="btn btn-ghost" onClick={backToOverview}>
+                  Overview
+                </button>
+                <Link to="/quiz" className="btn btn-ghost">Quit</Link>
+              </div>
             </div>
 
             <div className="quiz-progress-track">
-              <div
-                className="quiz-progress-fill"
-                style={{ width: `${((qIndex + (answered ? 1 : 0)) / total) * 100}%` }}
-              />
+              <div className="quiz-progress-fill" style={{ width: `${progress}%` }} />
+            </div>
+
+            <div className="quiz-tier-nav">
+              {QUIZ_TIER_ORDER.map((d) => {
+                const isCurrent = d === active
+                const wins = unlocked[d]
+                return (
+                  <button
+                    key={d}
+                    type="button"
+                    className={`quiz-tier-pill ${wins ? 'unlocked' : 'locked'} ${isCurrent ? 'quiz-tier-pill-active' : ''}`}
+                    onClick={() => tierCommand(d)}
+                  >
+                    {wins ? <IconCheck size={12} /> : <IconLock size={12} />}
+                    {DIFFICULTY_LABEL[d]}
+                    <span className="faint small">
+                      {wins
+                        ? `${tierProgress(d)}/${tierCount(d)}`
+                        : d === 'moderate'
+                          ? `${Math.min(3, attemptsCount.basic)}/3 Basic`
+                          : `${Math.min(3, attemptsCount.moderate)}/3 Moderate`}
+                    </span>
+                  </button>
+                )
+              })}
             </div>
 
             <div className="card" style={{ padding: '1.6rem 1.6rem 1.3rem' }}>
-              <p className="quiz-question" style={{ fontSize: '1.15rem', fontWeight: 600 }}>
-                {question.prompt}
-              </p>
-              {question.concept && (
-                <span className="badge badge-muted" style={{ marginBottom: '0.8rem', alignSelf: 'flex-start' }}>
-                  {question.concept}
-                </span>
-              )}
+              <div className="row wrap" style={{ gap: '0.5rem', marginBottom: '0.6rem' }}>
+                <span className={`quiz-difficulty-badge ${active}`}>{activeLabel}</span>
+                {currentQ.concept && <span className="badge badge-muted">{currentQ.concept}</span>}
+              </div>
 
-              <div className="col" style={{ gap: '0.7rem' }}>
-                {question.options.map((opt, i) => {
-                  let cls = 'quiz-option'
-                  let inner = <span className="quiz-radio">{String.fromCharCode(65 + i)}</span>
-                  if (answered) {
-                    if (i === question.correctIndex) {
-                      cls += ' correct'
-                      inner = (
-                        <span className="quiz-radio">
-                          <IconCheck size={11} />
-                        </span>
+              {isLocked ? (
+                renderLockedTier()
+              ) : (
+                <>
+                  <p className="quiz-question" style={{ fontSize: '1.15rem', fontWeight: 600 }}>
+                    {currentQ.prompt}
+                  </p>
+
+                  <div className="col" style={{ gap: '0.7rem' }}>
+                    {currentQ.options.map((opt, i) => {
+                      let cls = 'quiz-option'
+                      let inner = <span className="quiz-radio">{String.fromCharCode(65 + i)}</span>
+                      if (answeredNow) {
+                        if (i === currentQ.correctIndex) {
+                          cls += ' correct'
+                          inner = <span className="quiz-radio"><IconCheck size={11} /></span>
+                        } else if (i === answeredNow.selected) {
+                          cls += ' wrong'
+                          inner = <span className="quiz-radio"><IconX size={11} /></span>
+                        } else {
+                          cls += ' dim'
+                        }
+                      } else if (i === currentlySelected) {
+                        cls += ' selected'
+                      }
+                      return (
+                        <button
+                          key={i}
+                          className={cls}
+                          onClick={() =>
+                            setSelected((prev) => {
+                              const nextArr = [...prev]
+                              nextArr[questionIndex] = i
+                              return nextArr
+                            })
+                          }
+                          disabled={Boolean(answeredNow)}
+                        >
+                          {inner}
+                          <span>{opt}</span>
+                        </button>
                       )
-                    } else if (i === selected) {
-                      cls += ' wrong'
-                      inner = (
-                        <span className="quiz-radio">
-                          <IconX size={11} />
-                        </span>
-                      )
-                    } else {
-                      cls += ' dim'
-                    }
-                  } else if (i === selected) {
-                    cls += ' selected'
-                  }
-                  return (
-                    <button key={i} className={cls} onClick={() => choose(i)} disabled={answered}>
-                      {inner}
-                      <span>{opt}</span>
+                    })}
+                  </div>
+
+                  {answeredNow && (
+                    <div
+                      className={`banner ${answeredNow.correct ? 'banner-success' : 'banner-warning'} mt-1`}
+                    >
+                      <IconCheck size={17} />
+                      <span>
+                        {answeredNow.correct ? 'Correct! ' : 'Not quite. '}
+                        {currentQ.explanation}
+                      </span>
+                    </div>
+                  )}
+                  {!answeredNow && currentlySelected !== null && currentlySelected !== undefined && (
+                    <button
+                      className="btn btn-primary btn-block mt-2"
+                      onClick={() => submitAnswer(currentlySelected)}
+                      disabled={submitting}
+                    >
+                      {submitting ? 'Saving…' : 'Submit Answer'}
+                      <IconCheck size={15} />
                     </button>
-                  )
-                })}
-              </div>
+                  )}
 
-              {answered && (
-                <div
-                  className={`banner ${selected === question.correctIndex ? 'banner-success' : 'banner-warning'} mt-1`}
-                >
-                  <IconCheck size={17} />
-                  <span>
-                    {selected === question.correctIndex ? 'Correct! ' : 'Not quite. '}
-                    {question.explanation}
-                  </span>
-                </div>
+                  <div className="row-between mt-2">
+                    <button className="btn btn-ghost" onClick={goPrev} disabled={questionIndex <= tierStart}>
+                      Previous
+                    </button>
+                    <div
+                      className="row"
+                      style={{ gap: '0.6rem', flexWrap: 'wrap', justifyContent: 'center' }}
+                    >
+                      <span className="faint small">
+                        {tierDone}/{tierTotal} {activeLabel} answered
+                      </span>
+                      {answeredNow ? (
+                        atTierEnd ? (
+                          <button className="btn btn-primary" onClick={continueNext} disabled={submitting}>
+                            {nextUnlocked ? `Next: ${DIFFICULTY_LABEL[nextTier!]} Quiz` : 'Finish &amp; See Results'}
+                            {nextUnlocked ? <IconArrowRight size={15} /> : <IconTrend size={15} />}
+                          </button>
+                        ) : (
+                          <button
+                            className="btn btn-primary"
+                            onClick={goNext}
+                            disabled={submitting}
+                          >
+                            Next Question
+                            <IconArrowRight size={15} />
+                          </button>
+                        )
+                      ) : (
+                        <button
+                          className="btn btn-ghost"
+                          onClick={finishQuiz}
+                          disabled={answeredCount === 0 || submitting}
+                        >
+                          Finish &amp; See Results
+                          <IconTrend size={15} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </>
               )}
-
-              <div className="row-between mt-2">
-                <Link to="/ai-roadmap" className="btn btn-ghost">
-                  Quit
-                </Link>
-                <button className="btn btn-primary" onClick={nextQuestion} disabled={!answered}>
-                  {qIndex + 1 < total ? 'Next Question' : 'See Results'}
-                  <IconArrowRight size={15} />
-                </button>
-              </div>
             </div>
           </div>
 
@@ -469,10 +1143,7 @@ export default function Quiz() {
                 Every answer shapes your personalized study plan.
               </p>
               <div className="quiz-progress-track mt-2" style={{ height: 6 }}>
-                <div
-                  className="quiz-progress-fill"
-                  style={{ width: `${((qIndex + (answered ? 1 : 0)) / total) * 100}%` }}
-                />
+                <div className="quiz-progress-fill" style={{ width: `${progress}%` }} />
               </div>
               <ul className="keypoint-list mt-2" style={{ margin: '0.9rem 0 0' }}>
                 <li>
@@ -481,18 +1152,21 @@ export default function Quiz() {
                 </li>
                 <li>
                   <IconSparkles size={14} />
-                  <span>AI pinpoints your strong &amp; weak areas</span>
+                  <span>Answer 3 Basic to unlock Moderate, 3 Moderate to unlock Advanced</span>
                 </li>
                 <li>
                   <IconTrend size={14} />
-                  <span>Personalized next-topic recommendation</span>
+                  <span>AI pinpoints your strong &amp; weak areas</span>
                 </li>
               </ul>
             </div>
             <div className="card" style={{ marginTop: '1rem', padding: '1rem 1.1rem' }}>
               <div className="row" style={{ gap: '0.6rem' }}>
-                <IconTarget size={16} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-                <span className="small muted">Pro tip: read each explanation before moving on — it locks the concept in faster.</span>
+                <IconLock size={16} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+                <span className="small muted">
+                  Locked questions unlock as you submit answers — your choices unlock the next
+                  tier in real time.
+                </span>
               </div>
             </div>
           </aside>

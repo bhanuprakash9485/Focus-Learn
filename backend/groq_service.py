@@ -23,6 +23,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 # Load secrets from a local .env (backend/.env or project root .env) without
@@ -77,6 +80,31 @@ GUIDE_FIELDS: tuple[str, ...] = (
 
 class GroqConfigurationError(RuntimeError):
     """Raised when the Groq key or package is missing/misconfigured."""
+
+
+class QuizRateLimitError(RuntimeError):
+    """Raised when Groq returns HTTP 429 while generating a quiz.
+
+    Generation must stop immediately (no long retry loop) and surface a
+    friendly "rate limited" message instead of hanging or hammering the API.
+    """
+
+
+RATE_LIMIT_MESSAGE = (
+    "Quiz preparation is temporarily unavailable because the AI service is "
+    "rate limited. Please try again shortly."
+)
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """True when the underlying provider reported HTTP 429 (rate limit)."""
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    name = type(exc).__name__.lower()
+    code = str(getattr(exc, "code", "") or "").lower()
+    message = str(getattr(exc, "message", "") or "").lower()
+    return "ratelimit" in name or "rate_limit" in code or "rate limit" in message
 
 
 def groq_available() -> bool:
@@ -315,8 +343,10 @@ def _build_analysis_prompt(
         correct_ans = q["options"][correct_answers[i]] if i < len(correct_answers) else "N/A"
         is_correct = "Correct" if (i < len(answers) and i < len(correct_answers) and answers[i] == correct_answers[i]) else "Wrong"
         concept = q.get("concept", "General")
+        difficulty = str(q.get("difficulty", "") or "").strip().lower()
+        difficulty_tag = f" | Level: {difficulty}" if difficulty else ""
         q_lines.append(
-            f"Q{i+1}: \"{q.get('prompt', '')}\" | Concept: {concept} | "
+            f"Q{i+1}: \"{q.get('prompt', '')}\" | Concept: {concept}{difficulty_tag} | "
             f"Student answer: {student_ans} | Correct: {correct_ans} | {is_correct}"
         )
     questions_block = "\n".join(q_lines)
@@ -332,7 +362,9 @@ def _build_analysis_prompt(
         "2. Two questions testing the same concept count as ONE concept.\n"
         "3. Group weak concepts and recommend a focused revision plan.\n"
         "4. Determine if the student should pass, practice, or review.\n"
-        "5. Recommend the next topic in the learning path.\n\n"
+        "5. Recommend the next topic in the learning path.\n"
+        "6. Weigh difficulty tiers: strong basics with weak advanced results means the "
+        "fundamentals are solid but advanced problem-solving needs practice — say so.\n\n"
         "DECISION RULES:\n"
         "- score >= 80%: status='pass' — student understands, recommend next topic\n"
         "- score 60-79%: status='needs_practice' — partial understanding, identify weak concepts and recommend practice\n"
@@ -789,3 +821,563 @@ def create_roadmap(
 
     content = (response.choices[0].message.content if response.choices else None) or ""
     return _coerce_roadmap(content)
+
+
+# ---------------------------------------------------------------------------
+# Topic quiz generation — 30+ validated, topic-specific questions
+# ---------------------------------------------------------------------------
+
+# Ordered from easiest to hardest. The frontend relies on this order to show
+# the difficulty progression (basic -> moderate -> advanced).
+QUIZ_DIFFICULTIES: tuple[str, ...] = ("basic", "moderate", "advanced")
+
+# Default number of questions per topic quiz. Kept as a single knob so the
+# quiz can grow to 40/50/60 without redesigning the pipeline.
+DEFAULT_QUIZ_SIZE = 30
+
+# How many questions the model is asked for in a single call. A smaller batch
+# is more reliable; missing questions are topped up with extra calls.
+_QUIZ_BATCH = 10
+
+_DIFFICULTY_ALIASES = {
+    "basic": "basic",
+    "easy": "basic",
+    "beginner": "basic",
+    "foundation": "basic",
+    "fundamental": "basic",
+    "moderate": "moderate",
+    "intermediate": "moderate",
+    "medium": "moderate",
+    "advanced": "advanced",
+    "hard": "advanced",
+    "difficult": "advanced",
+    "expert": "advanced",
+}
+
+_QUIZ_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "of", "to", "in", "on", "at", "by", "for", "with", "about", "into",
+        "from", "as", "and", "or", "not", "no", "yes", "do", "does", "did",
+        "what", "which", "who", "whom", "whose", "when", "where", "why",
+        "how", "this", "that", "these", "those", "it", "its", "they", "them",
+        "their", "there", "here", "you", "your", "we", "our", "us", "can",
+        "could", "should", "would", "will", "shall", "may", "might", "must",
+        "following", "best", "correct", "answer", "statement", "true", "false",
+        "than", "then", "also", "such", "most", "more", "less", "used", "use",
+        "using", "given", "one", "two", "three", "all", "any", "each", "some",
+    }
+)
+
+
+def _significant_words(text: str) -> frozenset[str]:
+    """Content words of a question, used to detect duplicates."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return frozenset(w for w in words if len(w) >= 3 and w not in _QUIZ_STOPWORDS)
+
+
+def _is_duplicate_question(key: frozenset[str], existing: list[frozenset[str]]) -> bool:
+    """True when *key* repeats (or nearly repeats) a question already kept."""
+    if not key:
+        return True
+    for other in existing:
+        if key == other:
+            return True
+        # Ignore tiny single-word overlaps (common topic words like "array")
+        # and require a high Jaccard similarity before treating as duplicate.
+        if len(key) < 2 or len(other) < 2:
+            continue
+        shared = len(key & other)
+        if shared < 2:
+            continue
+        union = len(key | other)
+        if union and shared / union >= 0.8:
+            return True
+    return False
+
+
+def _quiz_target_counts(total: int, focus: bool = False) -> dict[str, int]:
+    """Split *total* across the three difficulties, easiest tier first.
+
+    The default (focus=False) split is as even as possible, so the canonical
+    30-question quiz is exactly 10/10/10. A focused retest weights the harder
+    tiers more heavily.
+    """
+    total = max(6, int(total))
+    if focus:
+        basic = max(1, round(total * 0.2))
+        advanced = max(1, round(total * 0.4))
+        intermediate = max(1, total - basic - advanced)
+    else:
+        basic = total // 3
+        intermediate = total // 3
+        advanced = total - basic - intermediate
+    return {"basic": basic, "intermediate": intermediate, "advanced": advanced}
+
+
+def _build_quiz_prompt(
+    topic: str,
+    level: str,
+    counts: dict[str, int],
+    focus_concepts: list[str],
+    existing_prompts: list[str],
+) -> str:
+    basic, intermediate, advanced = (
+        counts.get("basic", 0),
+        counts.get("intermediate", 0),
+        counts.get("advanced", 0),
+    )
+    total = basic + intermediate + advanced
+    tier_lines = []
+    if basic:
+        tier_lines.append(
+            f"- {basic} BASIC questions: definitions, terminology, fundamental concepts, "
+            "simple examples, direct recognition."
+        )
+    if intermediate:
+        tier_lines.append(
+            f"- {intermediate} MODERATE questions: applying concepts, tracing simple "
+            "logic, comparing approaches, small problems."
+        )
+    if advanced:
+        tier_lines.append(
+            f"- {advanced} ADVANCED questions: multi-step reasoning, edge cases, complexity "
+            "or trade-off analysis, harder scenarios."
+        )
+    focus_block = ""
+    if focus_concepts:
+        focus_block = (
+            "\nThe student was flagged for these weak concepts — every question MUST "
+            "directly test one of them:\n- " + "\n- ".join(focus_concepts) + "\n"
+        )
+    avoid_block = ""
+    if existing_prompts:
+        avoid_block = (
+            "\nDo NOT repeat or rephrase any of these already-written questions:\n- "
+            + "\n- ".join(existing_prompts[:40])
+            + "\n"
+        )
+    return (
+        "You are FocusLearn's quiz author. Write multiple-choice questions about the "
+        "EXACT topic below and nothing else.\n\n"
+        f"TOPIC: {topic}\n"
+        f"STUDENT LEVEL: {level}\n"
+        f"{focus_block}{avoid_block}\n"
+        f"Write EXACTLY {total} questions with this difficulty spread:\n"
+        + "\n".join(tier_lines)
+        + "\n\n"
+        "Quality rules:\n"
+        "- Every question must be genuinely specific to the topic (no filler, no "
+        "off-topic or generic study questions).\n"
+        "- Each question has exactly 4 options and exactly ONE correct answer.\n"
+        "- Vary which option index is correct; do not always use the same position.\n"
+        "- Every question must test a different concept — no duplicates or rephrasings.\n"
+        "- 'concept' must be a short subtopic label (e.g. 'Tree Traversal').\n"
+        "- 'explanation' must briefly justify the correct answer.\n"
+        "- Do not use trick or ambiguous questions.\n\n"
+        "Return ONLY valid JSON (no markdown fences, no commentary) matching EXACTLY:\n"
+        "{\n"
+        '  "topic": string,\n'
+        '  "questions": [\n'
+        "    {\n"
+        '      "prompt": string,\n'
+        '      "options": [string, string, string, string],\n'
+        '      "correctIndex": integer (0-3),\n'
+        '      "explanation": string,\n'
+        '      "difficulty": "basic" | "moderate" | "advanced",\n'
+        '      "concept": string\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+
+
+def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
+    """Parse Groq output into validated question dicts (drops invalid rows)."""
+    text = re.sub(r"^```(?:json)?\s*", "", (raw or "").strip())
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        # Some models return a bare JSON array.
+        a_start, a_end = text.find("["), text.rfind("]")
+        if a_start == -1 or a_end <= a_start:
+            raise ValueError("The quiz response could not be read as JSON.")
+        data = json.loads(text[a_start : a_end + 1])
+        raw_items = data
+    else:
+        data = json.loads(text[start : end + 1])
+        raw_items = data.get("questions") if isinstance(data, dict) else data
+    if not isinstance(raw_items, list):
+        raise ValueError("The quiz response did not contain a questions list.")
+
+    questions: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        prompt = str(item.get("prompt") or item.get("question") or "").strip()
+        if len(prompt) < 5:
+            continue
+        raw_options = item.get("options")
+        if not isinstance(raw_options, list):
+            continue
+        options = [str(o).strip() for o in raw_options if str(o).strip()]
+        if len(options) < 2:
+            continue
+
+        raw_index = item.get(
+            "correctIndex",
+            item.get("correct_answer", item.get("correct_index", item.get("answer"))),
+        )
+        try:
+            correct = int(raw_index)
+        except (TypeError, ValueError):
+            # Some models return the correct option's *text* or *letter* instead of an index.
+            if isinstance(raw_index, str):
+                letter = raw_index.strip().upper()
+                if len(letter) == 1 and "A" <= letter <= "F":
+                    correct = ord(letter) - ord("A")
+                elif raw_index in options:
+                    correct = options.index(raw_index)
+                else:
+                    continue
+            else:
+                continue
+        if not (0 <= correct < len(options)):
+            # Tolerate 1-based answers (1..len).
+            if 1 <= correct <= len(options):
+                correct -= 1
+            else:
+                continue
+
+        difficulty = _DIFFICULTY_ALIASES.get(
+            str(item.get("difficulty") or "").strip().lower(), ""
+        )
+        if not difficulty:
+            continue
+
+        concept = str(item.get("concept") or "").strip()[:80] or topic
+        explanation = str(item.get("explanation") or "").strip()
+        if not explanation:
+            explanation = f"The correct answer follows from the definition of {concept}."
+
+        questions.append(
+            {
+                "prompt": prompt[:600],
+                "options": [o[:300] for o in options[:6]],
+                "correctIndex": correct,
+                "explanation": explanation[:600],
+                "difficulty": difficulty,
+                "concept": concept,
+            }
+        )
+    return questions
+
+
+def _quiz_call(
+    topic: str,
+    level: str,
+    counts: dict[str, int],
+    focus_concepts: list[str],
+    existing_prompts: list[str],
+) -> list[dict]:
+    """One Groq call for a batch of questions. Returns [] on a bad payload."""
+    client = Groq(api_key=_groq_key())
+    messages = [
+        {
+            "role": "system",
+            "content": "You are FocusLearn's quiz author. "
+            "Output valid JSON only, with no extra text.",
+        },
+        {
+            "role": "user",
+            "content": _build_quiz_prompt(topic, level, counts, focus_concepts, existing_prompts),
+        },
+    ]
+    content = ""
+    # One structured attempt. On 429 we retry exactly once after a short
+    # pause (a bounded policy), then stop immediately — never loop indefinitely.
+    try:
+        response = client.chat.completions.create(
+            model=_MODEL,
+            messages=messages,
+            temperature=0.6,
+            max_tokens=8192,
+            response_format={"type": "json_object"},
+        )
+        content = (response.choices[0].message.content if response.choices else None) or ""
+    except Exception as exc:
+        if _is_rate_limit(exc):
+            time.sleep(2.0)
+            try:
+                response = client.chat.completions.create(
+                    model=_MODEL,
+                    messages=messages,
+                    temperature=0.6,
+                    max_tokens=8192,
+                    response_format={"type": "json_object"},
+                )
+                content = (response.choices[0].message.content if response.choices else None) or ""
+            except Exception as exc2:
+                if _is_rate_limit(exc2) or _is_rate_limit(exc):
+                    raise QuizRateLimitError(RATE_LIMIT_MESSAGE) from exc2
+                raise RuntimeError(
+                    "Quiz generation is temporarily unavailable. Please try again."
+                ) from exc2
+        else:
+            # The model occasionally fails strict JSON validation in json_object
+            # mode; retry once without it and parse the text ourselves.
+            try:
+                response = client.chat.completions.create(
+                    model=_MODEL,
+                    messages=messages,
+                    temperature=0.6,
+                    max_tokens=8192,
+                )
+                content = (response.choices[0].message.content if response.choices else None) or ""
+            except Exception:
+                raise RuntimeError(
+                    "Quiz generation is temporarily unavailable. Please try again."
+                ) from exc
+    try:
+        return _coerce_quiz_questions(content, topic)
+    except ValueError:
+        return []
+
+
+def generate_topic_quiz(
+    topic: str,
+    level: str = "beginner",
+    total: int = DEFAULT_QUIZ_SIZE,
+    focus_concepts: list[str] | None = None,
+) -> dict:
+    """Generate and validate a topic quiz with at least *total* questions.
+
+    The result is ordered easiest-first and guaranteed to contain the full
+    requested difficulty spread (10/10/10 by default). Missing questions are
+    topped up with extra Groq calls; a malformed batch is retried. Raises
+    ``GroqConfigurationError`` when Groq is unconfigured and ``RuntimeError``
+    when a complete, valid quiz could not be produced.
+    """
+    if not groq_available():
+        raise GroqConfigurationError(
+            "groq is not installed. Run: pip install -r backend/requirements.txt"
+        )
+    if not _groq_key():
+        raise GroqConfigurationError("Groq API key is not configured.")
+
+    topic = (topic or "").strip()[:200]
+    if not topic:
+        raise RuntimeError("A topic is required to generate a quiz.")
+    level = (level or "beginner").strip()[:20] or "beginner"
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        total = DEFAULT_QUIZ_SIZE
+    total = max(6, min(total, 60))
+
+    focus_concepts = [
+        str(c).strip()[:80] for c in (focus_concepts or []) if str(c).strip()
+    ][:12]
+    counts = _quiz_target_counts(total, focus=bool(focus_concepts))
+
+    collected: list[dict] = []
+    keys: list[frozenset[str]] = []
+
+    def count_for(difficulty: str) -> int:
+        return sum(1 for q in collected if q["difficulty"] == difficulty)
+
+    def ingest(items: list[dict]) -> None:
+        for q in items:
+            difficulty = q["difficulty"]
+            if count_for(difficulty) >= counts[difficulty]:
+                continue
+            key = _significant_words(q["prompt"])
+            if _is_duplicate_question(key, keys):
+                continue
+            collected.append(q)
+            keys.append(key)
+
+    # Generate tier by tier, in small batches, so no single call has to return
+    # the whole quiz (large JSON responses get truncated by the model).
+    for difficulty in QUIZ_DIFFICULTIES:
+        attempts = 0
+        while count_for(difficulty) < counts[difficulty] and attempts < 4:
+            attempts += 1
+            need = counts[difficulty] - count_for(difficulty)
+            batch = min(need, _QUIZ_BATCH)
+            existing_prompts = [q["prompt"] for q in collected]
+            before = count_for(difficulty)
+            try:
+                ingest(
+                    _quiz_call(
+                        topic,
+                        level,
+                        {difficulty: batch},
+                        focus_concepts,
+                        existing_prompts,
+                    )
+                )
+            except GroqConfigurationError:
+                raise
+            except QuizRateLimitError:
+                # Stop this generation run immediately - never hammer a 429.
+                raise
+            except RuntimeError:
+                continue
+            if count_for(difficulty) == before:
+                # No usable questions came back for this tier; stop retrying it.
+                break
+
+    ordered: list[dict] = []
+    for difficulty in QUIZ_DIFFICULTIES:
+        ordered.extend(
+            [q for q in collected if q["difficulty"] == difficulty][: counts[difficulty]]
+        )
+    if len(ordered) < total:
+        raise RuntimeError(
+            "The AI could not produce a complete quiz with the required difficulty "
+            "spread. Please try again."
+        )
+    for index, question in enumerate(ordered, start=1):
+        question["id"] = f"q{index}"
+    return {"topic": topic, "level": level, "total": len(ordered), "questions": ordered}
+
+
+def generate_parallel_topic_quiz(
+    topic: str,
+    level: str = "beginner",
+    total: int = DEFAULT_QUIZ_SIZE,
+    focus_concepts: list[str] | None = None,
+) -> dict:
+    """Generate a topic quiz using three CONCURRENT difficulty batches.
+
+    Requests 10 basic / 10 moderate / 10 advanced in parallel (three Groq
+    calls total, never one per question), then de-duplicates across tiers,
+    tops up any tier that came back short, and returns the combined quiz
+    ordered basic -> moderate -> advanced.
+    """
+    if not groq_available():
+        raise GroqConfigurationError(
+            "groq is not installed. Run: pip install -r backend/requirements.txt"
+        )
+    if not _groq_key():
+        raise GroqConfigurationError("Groq API key is not configured.")
+
+    topic = (topic or "").strip()[:200]
+    if not topic:
+        raise RuntimeError("A topic is required to generate a quiz.")
+    level = (level or "beginner").strip()[:20] or "beginner"
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        total = DEFAULT_QUIZ_SIZE
+    total = max(9, min(total, 60))
+
+    focus_concepts = [
+        str(c).strip()[:80] for c in (focus_concepts or []) if str(c).strip()
+    ][:12]
+
+    # Even 3-way split (10/10/10 for the default 30).
+    basic = total // 3
+    moderate = total // 3
+    advanced = total - basic - moderate
+    counts = {"basic": basic, "moderate": moderate, "advanced": advanced}
+
+    # Thread-safe cross-tier duplicate guard.
+    lock = threading.Lock()
+    global_keys: list[frozenset[str]] = []
+
+    def prompt_counts(difficulty: str, n: int) -> dict[str, int]:
+        """Map a tier name to the prompt's basic/intermediate/advanced keys."""
+        base = {"basic": 0, "intermediate": 0, "advanced": 0}
+        key = "intermediate" if difficulty == "moderate" else difficulty
+        base[key] = n
+        return base
+
+    def worker(difficulty: str, target: int) -> list[dict]:
+        items: list[dict] = []
+        attempts = 0
+        while len(items) < target and attempts < 4:
+            attempts += 1
+            need = target - len(items)
+            batch_existing = [q["prompt"] for q in items]
+            try:
+                batch = _quiz_call(
+                    topic,
+                    level,
+                    prompt_counts(difficulty, min(need, _QUIZ_BATCH)),
+                    focus_concepts,
+                    batch_existing,
+                )
+            except GroqConfigurationError:
+                raise
+            except QuizRateLimitError:
+                # Stop this generation run immediately - never hammer a 429.
+                raise
+            except RuntimeError:
+                continue
+            for q in batch:
+                if q["difficulty"] != difficulty:
+                    continue
+                key = _significant_words(q["prompt"])
+                with lock:
+                    if _is_duplicate_question(key, global_keys):
+                        continue
+                    global_keys.append(key)
+                items.append(q)
+        return items
+
+    collected: dict[str, list[dict]] = {d: [] for d in QUIZ_DIFFICULTIES}
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(worker, d, counts[d]): d for d in QUIZ_DIFFICULTIES
+        }
+        for future, difficulty in futures.items():
+            collected[difficulty] = future.result()
+
+    # Top up any tier still short after cross-tier de-duplication.
+    for difficulty in QUIZ_DIFFICULTIES:
+        for _ in range(3):
+            if len(collected[difficulty]) >= counts[difficulty]:
+                break
+            need = counts[difficulty] - len(collected[difficulty])
+            existing = [q["prompt"] for block in collected.values() for q in block]
+            try:
+                batch = _quiz_call(
+                    topic,
+                    level,
+                    prompt_counts(difficulty, min(need, _QUIZ_BATCH)),
+                    focus_concepts,
+                    existing,
+                )
+            except GroqConfigurationError:
+                raise
+            except QuizRateLimitError:
+                # Stop this generation run immediately - never hammer a 429.
+                raise
+            except RuntimeError:
+                continue
+            for q in batch:
+                if q["difficulty"] != difficulty:
+                    continue
+                key = _significant_words(q["prompt"])
+                if _is_duplicate_question(key, global_keys):
+                    continue
+                global_keys.append(key)
+                collected[difficulty].append(q)
+
+    ordered: list[dict] = []
+    for difficulty in QUIZ_DIFFICULTIES:
+        ordered.extend(collected[difficulty][: counts[difficulty]])
+    if len(ordered) < total:
+        raise RuntimeError(
+            "The AI could not produce a complete quiz with the required difficulty "
+            "spread. Please try again."
+        )
+    # Tier-scoped ids (basic-1..10, moderate-1..10, advanced-1..10) so the
+    # frontend and review screens can address questions by tier + position.
+    positions: dict[str, int] = {d: 0 for d in QUIZ_DIFFICULTIES}
+    for question in ordered:
+        positions[question["difficulty"]] += 1
+        question["id"] = f"{question['difficulty']}-{positions[question['difficulty']]}"
+    return {"topic": topic, "level": level, "total": len(ordered), "questions": ordered}

@@ -6,8 +6,18 @@ Sessions: 128-char hex token stored in SQLite + forwarded as HttpOnly cookie.
 
 Tables created on first call to ``init_db()``:
 
-    users(id, name, email, password_hash, created_at)
+    users(id, name, email, password_hash, google_id, firebase_uid,
+          auth_provider, created_at)
     sessions(token, user_id, created_at, expires_at)
+
+``auth_provider`` is ``'email'`` for password accounts and ``'google'`` for
+Google sign-in (both the Google Identity Services and Firebase flows).
+Google-only accounts have an empty ``password_hash`` (their
+``authenticate_user`` always fails) while linked accounts keep their hash so
+the password remains a valid alternative sign-in method. ``google_id`` stores
+a Google Identity Services subject id and ``firebase_uid`` a Firebase UID, so
+the two Google flows never collide. Existing databases are migrated in place —
+no rows are ever deleted or reset.
 """
 
 from __future__ import annotations
@@ -54,6 +64,9 @@ def init_db() -> None:
             name          TEXT NOT NULL,
             email         TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
+            google_id     TEXT,
+            firebase_uid  TEXT,
+            auth_provider TEXT NOT NULL DEFAULT 'email',
             created_at    TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -64,7 +77,33 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     """)
+    _migrate_legacy_schema(conn)
     conn.commit()
+
+
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+    """Add Google columns to databases that predate Google sign-in.
+
+    Only adds missing columns/indexes — existing rows are preserved and any
+    pre-Google rows are marked ``auth_provider='email'``.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "google_id" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN google_id TEXT")
+    if "firebase_uid" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN firebase_uid TEXT")
+    if "auth_provider" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'email'"
+        )
+    conn.execute(
+        "UPDATE users SET auth_provider = 'email' "
+        "WHERE auth_provider IS NULL OR auth_provider = ''"
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid)"
+    )
 
 
 # ── Password hashing ────────────────────────────────────────────────────
@@ -90,6 +129,18 @@ def _verify_password(password: str, stored: str) -> bool:
 
 # ── User CRUD ───────────────────────────────────────────────────────────
 
+def _user_dict(row) -> dict:
+    """Public user dict (never the hash). ``has_password`` tells clients
+    whether password-based sign-in is available on the account."""
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "created_at": row["created_at"],
+        "has_password": bool(row["password_hash"]),
+    }
+
+
 def create_user(name: str, email: str, password: str) -> dict | None:
     """Return the new user dict (no hash) or None if email is taken."""
     conn = _get_conn()
@@ -102,12 +153,34 @@ def create_user(name: str, email: str, password: str) -> dict | None:
     uid = f"usr-{secrets.token_hex(8)}"
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT INTO users (id, name, email, password_hash, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, name, email, password_hash, auth_provider, created_at) "
+        "VALUES (?, ?, ?, ?, 'email', ?)",
         (uid, name.strip(), email.lower(), _hash_password(password), now),
     )
     conn.commit()
-    return {"id": uid, "name": name.strip(), "email": email.lower(), "created_at": now}
+    return {"id": uid, "name": name.strip(), "email": email.lower(), "created_at": now,
+            "has_password": True}
+
+
+def create_google_user(google_id: str, name: str, email: str) -> dict | None:
+    """Create a Google-only account (no password). Returns the user dict or
+    None if the email is already taken."""
+    conn = _get_conn()
+    existing = conn.execute(
+        "SELECT id FROM users WHERE email = ?", (email.lower(),)
+    ).fetchone()
+    if existing:
+        return None
+
+    uid = f"usr-{secrets.token_hex(8)}"
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO users (id, name, email, password_hash, google_id, "
+        "auth_provider, created_at) VALUES (?, ?, ?, '', ?, 'google', ?)",
+        (uid, name.strip(), email.lower(), google_id, now),
+    )
+    conn.commit()
+    return get_user(uid)
 
 
 def authenticate_user(email: str, password: str) -> dict | None:
@@ -120,24 +193,103 @@ def authenticate_user(email: str, password: str) -> dict | None:
     ).fetchone()
     if not row or not _verify_password(password, row["password_hash"]):
         return None
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "email": row["email"],
-        "created_at": row["created_at"],
-    }
+    return _user_dict(row)
 
 
 def get_user(user_id: str) -> dict | None:
     conn = _get_conn()
     row = conn.execute(
-        "SELECT id, name, email, created_at FROM users WHERE id = ?",
+        "SELECT id, name, email, password_hash, created_at FROM users WHERE id = ?",
         (user_id,),
     ).fetchone()
     if not row:
         return None
-    return {"id": row["id"], "name": row["name"], "email": row["email"],
-            "created_at": row["created_at"]}
+    return _user_dict(row)
+
+
+def get_user_by_email(email: str) -> dict | None:
+    """Return the user for a verified email address, or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, name, email, password_hash, created_at FROM users WHERE email = ?",
+        (email.lower(),),
+    ).fetchone()
+    if not row:
+        return None
+    return _user_dict(row)
+
+
+def get_user_by_google_id(google_id: str) -> dict | None:
+    """Return the user linked to a Google account ID, or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, name, email, password_hash, created_at "
+        "FROM users WHERE google_id = ?",
+        (google_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return _user_dict(row)
+
+
+def link_google_to_user(user_id: str, google_id: str) -> None:
+    """Attach a verified Google identity to an existing account as an
+    additional sign-in method. A non-empty password hash is preserved, so
+    the account's existing password continues to work."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE users SET google_id = ?, auth_provider = 'google' WHERE id = ?",
+        (google_id, user_id),
+    )
+    conn.commit()
+
+
+# ── Firebase (Google) identities ────────────────────────────────────────
+
+def create_firebase_user(firebase_uid: str, name: str, email: str) -> dict | None:
+    """Create a Firebase-only account (no password). Returns the user dict or
+    None if the email is already taken."""
+    conn = _get_conn()
+    existing = conn.execute(
+        "SELECT id FROM users WHERE email = ?", (email.lower(),)
+    ).fetchone()
+    if existing:
+        return None
+
+    uid = f"usr-{secrets.token_hex(8)}"
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO users (id, name, email, password_hash, firebase_uid, "
+        "auth_provider, created_at) VALUES (?, ?, ?, '', ?, 'google', ?)",
+        (uid, name.strip(), email.lower(), firebase_uid, now),
+    )
+    conn.commit()
+    return get_user(uid)
+
+
+def get_user_by_firebase_uid(firebase_uid: str) -> dict | None:
+    """Return the user linked to a verified Firebase UID, or None."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT id, name, email, password_hash, created_at "
+        "FROM users WHERE firebase_uid = ?",
+        (firebase_uid,),
+    ).fetchone()
+    if not row:
+        return None
+    return _user_dict(row)
+
+
+def link_firebase_to_user(user_id: str, firebase_uid: str) -> None:
+    """Attach a verified Firebase identity to an existing account as an
+    additional sign-in method. A non-empty password hash is preserved, so
+    the account's existing password continues to work."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE users SET firebase_uid = ?, auth_provider = 'google' WHERE id = ?",
+        (firebase_uid, user_id),
+    )
+    conn.commit()
 
 
 def update_user(user_id: str, *, name: str | None = None, email: str | None = None) -> dict | None:
@@ -183,7 +335,7 @@ def validate_session(token: str) -> dict | None:
         return None
     conn = _get_conn()
     row = conn.execute(
-        "SELECT s.user_id, u.name, u.email, u.created_at "
+        "SELECT s.user_id, u.name, u.email, u.created_at, u.password_hash "
         "FROM sessions s JOIN users u ON s.user_id = u.id "
         "WHERE s.token = ?",
         (token,),
@@ -207,7 +359,8 @@ def validate_session(token: str) -> dict | None:
         except Exception:
             pass
     return {"id": row["user_id"], "name": row["name"], "email": row["email"],
-            "created_at": row["created_at"]}
+            "created_at": row["created_at"],
+            "has_password": bool(row["password_hash"])}
 
 
 def delete_session(token: str) -> None:

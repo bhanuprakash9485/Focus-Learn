@@ -15,6 +15,7 @@ import {
 import { getWeakAreas } from '../services/progress'
 import { searchYouTubeVideos } from '../services/youtubeService'
 import { PlaylistNavigator } from '../components/PlaylistNavigator'
+import TopicQuizCard from '../components/TopicQuizCard'
 import type { PlaylistInfo, PlaylistVideoRef, YouTubeVideo } from '../types'
 import {
   IconArrowLeft,
@@ -804,17 +805,7 @@ export default function TopicFocus() {
                   <strong>{totalFocusMinutes}</strong>
                 </div>
               </div>
-              <button
-                type="button"
-                className="btn btn-primary btn-block"
-                onClick={() => navigate(`/quiz/topic/${encodeURIComponent(topic)}`, { state: { topic } })}
-              >
-                <IconQuiz size={16} />
-                Take Quiz
-              </button>
-              <p className="small faint mt-1" style={{ textAlign: 'center' }}>
-                A {topic} quiz — generated for this topic, never another.
-              </p>
+              <TopicQuizCard topic={topic} />
             </AssistantCard>
           </aside>
 

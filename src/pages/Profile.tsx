@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AppLayout } from '../components/AppLayout'
+import { ThemeToggle } from '../components/ThemeToggle'
 import { useApp } from '../context/AppContext'
 import { getAverageScore } from '../services/progress'
 import { AuthError, authApi } from '../services/auth'
@@ -28,9 +29,8 @@ export default function Profile() {
     setBlockedSites,
     attempts,
     resetAllProgress,
-    theme,
-    toggleTheme,
     activeGoal,
+    currentUser,
     aiRoadmapTopics,
     completedLessonIds,
     totalFocusMinutes,
@@ -233,14 +233,12 @@ export default function Profile() {
             </div>
             <div className="list-row">
               <div>
-                <div className="small" style={{ fontWeight: 600 }}>Dark mode</div>
+                <div className="small" style={{ fontWeight: 600 }}>Theme</div>
                 <div className="faint" style={{ fontSize: '0.8rem' }}>
-                  Coming soon — currently light theme only.
+                  Light, dark or system — saved on this device.
                 </div>
               </div>
-              <button type="button" className="btn btn-secondary" onClick={toggleTheme} disabled>
-                {theme === 'light' ? 'Light' : 'Dark'}
-              </button>
+              <ThemeToggle />
             </div>
           </div>
 
@@ -302,51 +300,53 @@ export default function Profile() {
           </button>
         </form>
 
-        {/* Security: change password */}
-        <form onSubmit={handlePasswordChange}>
-          <div className="card mt-3">
-            <div className="row mb-1" style={{ color: 'var(--primary)' }}>
-              <IconKey size={18} />
-              <h2 className="section-title" style={{ marginBottom: 0 }}>Account Security</h2>
+        {/* Security: change password (hidden for Google-only accounts that have no password) */}
+        {currentUser?.hasPassword !== false && (
+          <form onSubmit={handlePasswordChange}>
+            <div className="card mt-3">
+              <div className="row mb-1" style={{ color: 'var(--primary)' }}>
+                <IconKey size={18} />
+                <h2 className="section-title" style={{ marginBottom: 0 }}>Account Security</h2>
+              </div>
+              {pwMsg && (
+                <div
+                  className={`banner ${pwMsg.kind === 'success' ? 'banner-success' : 'banner-danger'} mb-1`}
+                  role={pwMsg.kind === 'success' ? 'status' : 'alert'}
+                >
+                  {pwMsg.text}
+                </div>
+              )}
+              <div className="grid grid-2">
+                <div className="form-group">
+                  <label htmlFor="pf-pw-current">Current password</label>
+                  <input
+                    id="pf-pw-current"
+                    type="password"
+                    autoComplete="current-password"
+                    value={pwCurrent}
+                    onChange={(e) => setPwCurrent(e.target.value)}
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="pf-pw-new">New password</label>
+                  <input
+                    id="pf-pw-new"
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder="At least 6 characters"
+                    value={pwNew}
+                    onChange={(e) => setPwNew(e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+              <button type="submit" className="btn btn-secondary" disabled={pwBusy}>
+                {pwBusy ? 'Updating…' : 'Update Password'}
+              </button>
             </div>
-            {pwMsg && (
-              <div
-                className={`banner ${pwMsg.kind === 'success' ? 'banner-success' : 'banner-danger'} mb-1`}
-                role={pwMsg.kind === 'success' ? 'status' : 'alert'}
-              >
-                {pwMsg.text}
-              </div>
-            )}
-            <div className="grid grid-2">
-              <div className="form-group">
-                <label htmlFor="pf-pw-current">Current password</label>
-                <input
-                  id="pf-pw-current"
-                  type="password"
-                  autoComplete="current-password"
-                  value={pwCurrent}
-                  onChange={(e) => setPwCurrent(e.target.value)}
-                  required
-                />
-              </div>
-              <div className="form-group">
-                <label htmlFor="pf-pw-new">New password</label>
-                <input
-                  id="pf-pw-new"
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder="At least 6 characters"
-                  value={pwNew}
-                  onChange={(e) => setPwNew(e.target.value)}
-                  required
-                />
-              </div>
-            </div>
-            <button type="submit" className="btn btn-secondary" disabled={pwBusy}>
-              {pwBusy ? 'Updating…' : 'Update Password'}
-            </button>
-          </div>
-        </form>
+          </form>
+        )}
 
         {/* Study stats snapshot */}
         <div className="card mt-3">

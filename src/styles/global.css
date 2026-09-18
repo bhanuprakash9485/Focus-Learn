@@ -1049,6 +1049,70 @@ a {
   text-align: center;
 }
 
+/* ---------- Google sign-in ("Continue with Google") ---------- */
+.google-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.65rem;
+  width: 100%;
+  padding: 0.72rem 1rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-xs);
+  cursor: pointer;
+  transition: border-color var(--t-base), background var(--t-base),
+    box-shadow var(--t-base), transform var(--t-base);
+}
+.google-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+}
+.google-btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.995);
+}
+.google-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.google-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+.google-btn svg {
+  flex-shrink: 0;
+}
+.spinner-sm {
+  width: 16px;
+  height: 16px;
+}
+
+/* "──────── OR ────────" separator between Google and email/password */
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.05rem 0;
+  color: var(--faint);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
 /* ---------- Roadmap page ---------- */
 .roadmap-path {
   position: relative;

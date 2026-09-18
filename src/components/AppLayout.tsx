@@ -3,6 +3,7 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext'
 import { GlobalSearchBar } from './GlobalSearchBar'
 import { Logo } from './Logo'
+import { ThemeToggle } from './ThemeToggle'
 import {
   IconBell,
   IconBranch,
@@ -154,6 +155,7 @@ export function AppLayout({
           <div className="topbar-spacer" />
 
           <div className="row">
+            <ThemeToggle />
             <button
               className="icon-btn bell-btn"
               title="Notifications"

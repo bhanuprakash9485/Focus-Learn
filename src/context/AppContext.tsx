@@ -8,20 +8,26 @@ import {
   type ReactNode,
 } from 'react'
 import type {
+  ActivityEvent,
   AiGeneratedRoadmap,
   AiRoadmapTopic,
   AuthStage,
   AuthUser,
+  Difficulty,
   Goal,
+  GoalAction,
+  GoalInput,
   QuizAttempt,
   Roadmap,
   User,
+  UserGoal,
   YouTubeVideo,
 } from '../types'
 import { sampleStudent } from '../data/student'
 import { goals as goalCatalog } from '../data/goals'
 import { getRoadmapForGoal } from '../data/roadmaps'
 import { authApi } from '../services/auth'
+import { goalsApi, GoalError } from '../services/goals'
 
 /** Legacy single-writer key ("guest" / pre-auth state). */
 const GUEST_STORAGE_KEY = 'focuslearn-state-v1'
@@ -45,6 +51,10 @@ interface StoredState {
   aiRoadmapTopics: AiRoadmapTopic[]
   /** The currently generated AI roadmap for the student's chosen topic. */
   aiRoadmap: AiGeneratedRoadmap | null
+  /** Focus minutes tracked per calendar day (YYYY-MM-DD) — drives the daily target. */
+  focusMinutesByDay: Record<string, number>
+  /** Recent learning events (lessons, quizzes, focus sessions). */
+  activity: ActivityEvent[]
 }
 interface AppContextValue extends StoredState {
   goals: Goal[]
@@ -62,10 +72,33 @@ interface AppContextValue extends StoredState {
   currentUser: AuthUser | null
   login: (email: string, password: string) => Promise<AuthUser>
   signup: (name: string, email: string, password: string) => Promise<AuthUser>
+  /** Complete Google sign-in with a verified ID token from the backend. */
+  loginWithGoogle: (credential: string) => Promise<AuthUser>
+  /**
+   * Complete Firebase Google sign-in: the backend verifies the Firebase ID
+   * token and establishes the same FocusLearn session.
+   */
+  loginWithFirebase: (idToken: string) => Promise<AuthUser>
   logout: () => Promise<void>
   refreshUser: () => Promise<AuthUser | null>
   /** Sync name/email changes to the backend account. */
   updateAccountInfo: (patch: { name?: string; email?: string }) => Promise<AuthUser>
+  /* ── User goals (backend-backed, per account) ────────────── */
+  /** Personal goals created by the user (distinct from the curated catalog). */
+  userGoals: UserGoal[]
+  /** True while the goal list is loading from the backend. */
+  goalsLoading: boolean
+  /** Last goal-loading error, or null. */
+  goalsError: string | null
+  /** The user's primary goal (falls back to the first active goal). */
+  primaryGoal: UserGoal | null
+  /** Reload the goal list from the backend. */
+  refreshGoals: () => Promise<void>
+  createGoal: (input: GoalInput) => Promise<UserGoal>
+  updateGoal: (id: string, patch: Partial<GoalInput>) => Promise<UserGoal>
+  deleteGoal: (id: string) => Promise<void>
+  /** Run a status transition or mark a goal primary. */
+  runGoalAction: (id: string, action: GoalAction) => Promise<UserGoal>
   /* ───────────────────────────────────────────────────────── */
   selectGoal: (goalId: string) => void
   markLessonComplete: (lessonId: string) => void
@@ -89,13 +122,111 @@ interface AppContextValue extends StoredState {
 
 const AppContext = createContext<AppContextValue | null>(null)
 
+const DIFFICULTIES: Difficulty[] = ['Beginner', 'Intermediate', 'Advanced']
+
+/** Coerce an arbitrary persisted user object into a valid profile. */
+function sanitizeUser(raw: unknown): User {
+  const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const str = (v: unknown, fallback: string): string =>
+    typeof v === 'string' && v.length > 0 ? v : fallback
+  const num = (v: unknown, fallback: number): number =>
+    typeof v === 'number' && Number.isFinite(v) ? v : fallback
+  const level = DIFFICULTIES.includes(p.level as Difficulty)
+    ? (p.level as Difficulty)
+    : sampleStudent.level
+  return {
+    id: str(p.id, sampleStudent.id),
+    name: str(p.name, sampleStudent.name),
+    email: str(p.email, sampleStudent.email),
+    field: str(p.field, sampleStudent.field),
+    level,
+    dailyGoalMinutes: num(p.dailyGoalMinutes, sampleStudent.dailyGoalMinutes),
+    joinedAt: str(p.joinedAt, sampleStudent.joinedAt),
+    focusStreakDays: num(p.focusStreakDays, sampleStudent.focusStreakDays),
+  }
+}
+
+/**
+ * Coerce an arbitrary parsed localStorage record into the StoredState
+ * contract, filling a safe default for every missing or malformed field.
+ * A stale / partially-written record (e.g. written by an earlier app
+ * iteration before the current schema) must never crash the UI. Returns
+ * null when the record is unusable (no object / no user block) so the
+ * caller falls back to a fresh state.
+ */
+function sanitizeStored(parsed: unknown): StoredState | null {
+  if (!parsed || typeof parsed !== 'object') return null
+  const p = parsed as Record<string, unknown>
+  if (!p.user || typeof p.user !== 'object') return null
+  return {
+    user: sanitizeUser(p.user),
+    activeGoalId:
+      typeof p.activeGoalId === 'string' || p.activeGoalId === null ? p.activeGoalId : 'web-dev',
+    completedLessonIds: (Array.isArray(p.completedLessonIds) ? p.completedLessonIds : []).filter(
+      (x): x is string => typeof x === 'string',
+    ),
+    attempts: (Array.isArray(p.attempts) ? p.attempts : []).filter(
+      (a): a is QuizAttempt =>
+        !!a && typeof a === 'object' && Array.isArray((a as QuizAttempt).missedQuestionIds),
+    ),
+    blockedSites: (Array.isArray(p.blockedSites) ? p.blockedSites : []).filter(
+      (x): x is string => typeof x === 'string',
+    ),
+    totalFocusMinutes: typeof p.totalFocusMinutes === 'number' ? p.totalFocusMinutes : 0,
+    focusSessionsToday: typeof p.focusSessionsToday === 'number' ? p.focusSessionsToday : 0,
+    theme: p.theme === 'dark' ? 'dark' : 'light',
+    aiRoadmapTopics: (Array.isArray(p.aiRoadmapTopics) ? p.aiRoadmapTopics : []).filter(
+      (t): t is AiRoadmapTopic => {
+        if (!t || typeof t !== 'object') return false
+        const topic = t as AiRoadmapTopic
+        return typeof topic.id === 'string' && typeof topic.name === 'string'
+      },
+    ),
+    aiRoadmap:
+      p.aiRoadmap && typeof p.aiRoadmap === 'object'
+        ? (p.aiRoadmap as AiGeneratedRoadmap)
+        : null,
+    focusMinutesByDay: sanitizeFocusMinutes(p.focusMinutesByDay),
+    activity: (Array.isArray(p.activity) ? p.activity : []).filter(
+      (a): a is ActivityEvent => {
+        if (!a || typeof a !== 'object') return false
+        const ev = a as ActivityEvent
+        return (
+          typeof ev.id === 'string' &&
+          (ev.kind === 'lesson' || ev.kind === 'quiz' || ev.kind === 'focus') &&
+          typeof ev.label === 'string' &&
+          typeof ev.at === 'string'
+        )
+      },
+    ),
+  }
+}
+
+/** Coerce an arbitrary parsed value into a day → minutes map. */
+function sanitizeFocusMinutes(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, number> = {}
+  Object.entries(raw as Record<string, unknown>).forEach(([day, mins]) => {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(day) && typeof mins === 'number' && Number.isFinite(mins)) {
+      out[day] = mins
+    }
+  })
+  return out
+}
+
+/** Local calendar day key (YYYY-MM-DD) used for the daily learning target. */
+function todayKey(): string {
+  const d = new Date()
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
 function loadStored(key: string): StoredState | null {
   try {
     const raw = localStorage.getItem(key)
-    if (raw) {
-      const parsed = JSON.parse(raw) as StoredState
-      if (parsed && typeof parsed === 'object' && parsed.user) return parsed
-    }
+    if (raw) return sanitizeStored(JSON.parse(raw))
   } catch {
     // Corrupt storage — caller falls back to fresh state.
   }
@@ -158,6 +289,8 @@ function freshStoredState(user: User): StoredState {
     theme: base?.theme ?? 'light',
     aiRoadmapTopics: base?.aiRoadmapTopics ?? [],
     aiRoadmap: base?.aiRoadmap ?? null,
+    focusMinutesByDay: base?.focusMinutesByDay ?? {},
+    activity: base?.activity ?? [],
   }
 }
 
@@ -212,6 +345,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   /* ── Authentication state ───────────────────────────────────────────── */
   const [authStage, setAuthStage] = useState<AuthStage>('loading')
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
+
+  /* ── User goals (server-side, loaded once authenticated) ──────────── */
+  const [userGoals, setUserGoals] = useState<UserGoal[]>([])
+  const [goalsLoading, setGoalsLoading] = useState(false)
+  const [goalsError, setGoalsError] = useState<string | null>(null)
 
   /** Central Focus Mode state — the current topic drives every AI feature. */
   const [currentTopic, setCurrentTopicState] = useState<string | null>(null)
@@ -291,6 +429,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [adoptUser],
   )
 
+  const loginWithGoogle = useCallback(
+    async (credential: string) => {
+      const user = await authApi.googleLogin(credential)
+      adoptUser(user)
+      return user
+    },
+    [adoptUser],
+  )
+
+  const loginWithFirebase = useCallback(
+    async (idToken: string) => {
+      const user = await authApi.firebaseLogin(idToken)
+      adoptUser(user)
+      return user
+    },
+    [adoptUser],
+  )
+
   const logout = useCallback(async () => {
     await authApi.logout()
     setCurrentUser(null)
@@ -314,45 +470,195 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return updated
   }, [])
 
+  /* ── User goals (backend-backed) ────────────────────────────────────── */
+
+  const goalErrorMessage = useCallback(
+    (err: unknown): string =>
+      err instanceof GoalError
+        ? err.message
+        : 'Something went wrong with your goals. Please try again.',
+    [],
+  )
+
+  const refreshGoals = useCallback(async () => {
+    if (!currentUser) {
+      setUserGoals([])
+      return
+    }
+    setGoalsLoading(true)
+    setGoalsError(null)
+    try {
+      setUserGoals(await goalsApi.list())
+    } catch (err) {
+      setGoalsError(goalErrorMessage(err))
+    } finally {
+      setGoalsLoading(false)
+    }
+  }, [currentUser, goalErrorMessage])
+
+  // Load goals whenever an account becomes active; clear on sign-out so a
+  // guest never sees the previous account's goals.
+  useEffect(() => {
+    if (authStage !== 'authed' || !currentUser) {
+      setUserGoals([])
+      setGoalsError(null)
+      return
+    }
+    void refreshGoals()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authStage, currentUser?.id])
+
+  /** Insert or replace a goal, keeping "primary" unique in local state. */
+  const applyGoal = useCallback((goal: UserGoal) => {
+    setUserGoals((prev) => {
+      const exists = prev.some((g) => g.id === goal.id)
+      const next = exists
+        ? prev.map((g) => (g.id === goal.id ? goal : g))
+        : [goal, ...prev]
+      return goal.isPrimary ? next.map((g) => (g.id === goal.id ? g : { ...g, isPrimary: false })) : next
+    })
+  }, [])
+
+  const createGoal = useCallback(
+    async (input: GoalInput) => {
+      const goal = await goalsApi.create(input)
+      applyGoal(goal)
+      return goal
+    },
+    [applyGoal],
+  )
+
+  const updateGoal = useCallback(
+    async (id: string, patch: Partial<GoalInput>) => {
+      const goal = await goalsApi.update(id, patch)
+      applyGoal(goal)
+      return goal
+    },
+    [applyGoal],
+  )
+
+  const deleteGoal = useCallback(async (id: string) => {
+    await goalsApi.remove(id)
+    setUserGoals((prev) => prev.filter((g) => g.id !== id))
+  }, [])
+
+  const runGoalAction = useCallback(
+    async (id: string, action: GoalAction) => {
+      const goal = await goalsApi.action(id, action)
+      applyGoal(goal)
+      return goal
+    },
+    [applyGoal],
+  )
+
+  /** Primary goal: explicit flag first, then the first active goal. */
+  const primaryGoal = useMemo(
+    () =>
+      userGoals.find((g) => g.isPrimary) ??
+      userGoals.find((g) => g.status === 'active') ??
+      null,
+    [userGoals],
+  )
+
   /* ── Core state mutations ───────────────────────────────────────────── */
+
+  /** Roadmap derived from the active goal — resolved before mutators append activity. */
+  const activeGoal = useMemo(
+    () => goalCatalog.find((g) => g.id === state.activeGoalId) ?? null,
+    [state.activeGoalId],
+  )
+  const roadmap = useMemo(
+    () => (activeGoal ? getRoadmapForGoal(activeGoal.id) ?? null : null),
+    [activeGoal],
+  )
+
+  /** Resolve the human title of a lesson id (roadmap lessons only). */
+  const lessonTitleOf = useCallback(
+    (lessonId: string): string => {
+      if (!roadmap) return lessonId
+      for (const step of roadmap.steps) {
+        const lesson = step.lessons.find((l) => l.id === lessonId)
+        if (lesson) return lesson.title
+      }
+      return lessonId
+    },
+    [roadmap],
+  )
+
+  const pushActivity = useCallback(
+    (kind: ActivityEvent['kind'], label: string, detail?: string): ActivityEvent => ({
+      id: `act-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      kind,
+      label,
+      detail,
+      at: new Date().toISOString(),
+    }),
+    [],
+  )
 
   const selectGoal = useCallback((goalId: string) => {
     setState((s) => ({ ...s, activeGoalId: goalId }))
   }, [])
 
-  const markLessonComplete = useCallback((lessonId: string) => {
-    setState((s) =>
-      s.completedLessonIds.includes(lessonId)
-        ? s
-        : { ...s, completedLessonIds: [...s.completedLessonIds, lessonId] },
-    )
-  }, [])
+  const markLessonComplete = useCallback(
+    (lessonId: string) => {
+      const title = lessonTitleOf(lessonId)
+      setState((s) => {
+        if (s.completedLessonIds.includes(lessonId)) return s
+        const event = pushActivity('lesson', title)
+        return {
+          ...s,
+          completedLessonIds: [...s.completedLessonIds, lessonId],
+          activity: [event, ...s.activity].slice(0, 30),
+        }
+      })
+    },
+    [lessonTitleOf, pushActivity],
+  )
 
-  const recordAttempt = useCallback((attempt: Omit<QuizAttempt, 'id' | 'completedAt'>) => {
-    setState((s) => ({
-      ...s,
-      attempts: [
-        ...s.attempts,
-        {
-          ...attempt,
-          id: `att-${Date.now()}`,
-          completedAt: new Date().toISOString().slice(0, 10),
-        },
-      ],
-    }))
-  }, [])
+  const recordAttempt = useCallback(
+    (attempt: Omit<QuizAttempt, 'id' | 'completedAt'>) => {
+      const title = lessonTitleOf(attempt.lessonId)
+      const event = pushActivity('quiz', title, `${attempt.percentage}%`)
+      setState((s) => ({
+        ...s,
+        attempts: [
+          ...s.attempts,
+          {
+            ...attempt,
+            id: `att-${Date.now()}`,
+            completedAt: new Date().toISOString().slice(0, 10),
+          },
+        ],
+        activity: [event, ...s.activity].slice(0, 30),
+      }))
+    },
+    [lessonTitleOf, pushActivity],
+  )
 
   const setBlockedSites = useCallback((sites: string[]) => {
     setState((s) => ({ ...s, blockedSites: sites }))
   }, [])
 
-  const logFocusSession = useCallback((minutes: number) => {
-    setState((s) => ({
-      ...s,
-      totalFocusMinutes: s.totalFocusMinutes + minutes,
-      focusSessionsToday: s.focusSessionsToday + 1,
-    }))
-  }, [])
+  const logFocusSession = useCallback(
+    (minutes: number) => {
+      const event = pushActivity('focus', 'Focus session', `${minutes} min`)
+      setState((s) => {
+        const day = todayKey()
+        return {
+          ...s,
+          totalFocusMinutes: s.totalFocusMinutes + minutes,
+          focusSessionsToday: s.focusSessionsToday + 1,
+          focusMinutesByDay: {
+            ...s.focusMinutesByDay,
+            [day]: (s.focusMinutesByDay[day] ?? 0) + minutes,
+          },
+          activity: [event, ...s.activity].slice(0, 30),
+        }
+      })
+    },
+    [pushActivity],
+  )
 
   const updateUser = useCallback((patch: Partial<User>) => {
     setState((s) => ({ ...s, user: { ...s.user, ...patch } }))
@@ -417,15 +723,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, aiRoadmap: roadmap, aiRoadmapTopics: flattened }))
   }, [])
 
-  const activeGoal = useMemo(
-    () => goalCatalog.find((g) => g.id === state.activeGoalId) ?? null,
-    [state.activeGoalId],
-  )
-  const roadmap = useMemo(
-    () => (activeGoal ? getRoadmapForGoal(activeGoal.id) ?? null : null),
-    [activeGoal],
-  )
-
   const value: AppContextValue = {
     ...state,
     goals: goalCatalog,
@@ -440,9 +737,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     currentUser,
     login,
     signup,
+    loginWithGoogle,
+    loginWithFirebase,
     logout,
     refreshUser,
     updateAccountInfo,
+    userGoals,
+    goalsLoading,
+    goalsError,
+    primaryGoal,
+    refreshGoals,
+    createGoal,
+    updateGoal,
+    deleteGoal,
+    runGoalAction,
     selectGoal,
     markLessonComplete,
     recordAttempt,

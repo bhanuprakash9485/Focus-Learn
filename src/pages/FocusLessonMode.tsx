@@ -35,7 +35,7 @@ function LessonReader({ content }: { content: string }) {
           <code
             key={`${keyPrefix}-${i}`}
             style={{
-              background: '#f0f1f8',
+              background: 'var(--surface-2)',
               borderRadius: 5,
               padding: '0.1rem 0.35rem',
               fontSize: '0.9em',
@@ -274,7 +274,7 @@ export function FocusLessonMode() {
                   {hasQuiz && (
                     <button
                       className="btn btn-primary"
-                      onClick={() => navigate(`/quiz/${located.lesson.id}`)}
+                      onClick={() => navigate(`/quiz/topic/${encodeURIComponent(located.lesson.title)}`)}
                     >
                       <IconQuiz size={16} />
                       Take the Quiz

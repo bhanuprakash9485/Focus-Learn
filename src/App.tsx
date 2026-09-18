@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { AppProvider } from './context/AppContext'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import Landing from './pages/Landing'
 import Login from './pages/Login'
@@ -20,8 +21,9 @@ import Settings from './pages/Settings'
 
 export default function App() {
   return (
-    <AppProvider>
-      <Routes>
+    <ErrorBoundary>
+      <AppProvider>
+        <Routes>
       {/* Public pages */}
       <Route path="/" element={<Landing />} />
       <Route path="/login" element={<Login />} />
@@ -49,7 +51,8 @@ export default function App() {
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </AppProvider>
+        </Routes>
+      </AppProvider>
+    </ErrorBoundary>
   )
 }

@@ -1,6 +1,8 @@
 import { useState, type FormEvent } from 'react'
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { Logo } from '../components/Logo'
+import { GoogleButton } from '../components/GoogleButton'
+import { ThemeToggle } from '../components/ThemeToggle'
 import { AuthError } from '../services/auth'
 import { IconEye } from '../components/Icons'
 import { useApp } from '../context/AppContext'
@@ -19,6 +21,7 @@ export default function Signup() {
   const [confirm, setConfirm] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [googleBusy, setGoogleBusy] = useState(false)
   const [errors, setErrors] = useState<{ field?: string; form?: string }>({})
 
   const from = (location.state as { from?: string } | null)?.from ?? '/dashboard'
@@ -71,6 +74,7 @@ export default function Signup() {
     <div className="auth-page">
       <nav className="auth-nav">
         <Logo to="/" />
+        <ThemeToggle />
       </nav>
       <div className="auth-body">
         <div className="auth-card">
@@ -85,6 +89,16 @@ export default function Signup() {
               {errors.form}
             </div>
           )}
+
+          <GoogleButton
+            onSuccess={() => navigate(from, { replace: true })}
+            onError={(m) => setErrors({ form: m })}
+            disabled={busy}
+            onLoadingChange={setGoogleBusy}
+          />
+          <div className="auth-divider" aria-hidden="true">
+            <span>OR</span>
+          </div>
 
           <form onSubmit={handleSubmit} noValidate>
             <div className="form-group">
@@ -148,7 +162,7 @@ export default function Signup() {
             <button
               type="submit"
               className="btn btn-primary btn-block"
-              disabled={busy}
+              disabled={busy || googleBusy}
               aria-busy={busy}
             >
               {busy ? 'Creating account…' : 'Sign Up'}

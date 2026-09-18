@@ -1,0 +1,386 @@
+/* ============================================================
+   THEME SYSTEM — Light / Dark / System
+   FocusLearn
+
+   Loaded LAST (after global.css and master-redesign.css). The
+   `[data-theme='dark']` selectors override the light `:root`
+   tokens on equal-or-higher specificity, so this file owns the
+   dark palette and the light/dark switches.
+
+   `data-theme` is set on <html> by the inline FOUC script in
+   index.html before React mounts, and kept in sync by
+   ThemeContext (see src/context/ThemeContext.tsx).
+   ============================================================ */
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------
+   Dark palette tokens
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] {
+  --bg: #0d1221;
+  --bg-2: #111731;
+  --bg-tint: #0f1527;
+  --surface: #151b30;
+  --surface-2: #1b2240;
+  --border: #252e4a;
+  --border-strong: #364160;
+  --text: #eaeefc;
+  --muted: #a9b0cc;
+  --faint: #7e86a6;
+
+  --primary: #7c86f6;
+  --primary-hover: #93a0fa;
+  --primary-soft: rgba(124, 134, 246, 0.16);
+  --primary-ring: rgba(124, 134, 246, 0.35);
+
+  --accent: #a78bfa;
+  --accent-soft: rgba(167, 139, 250, 0.16);
+
+  --success: #34d399;
+  --success-soft: rgba(16, 185, 129, 0.15);
+  --warning: #fbbf24;
+  --warning-soft: rgba(245, 158, 11, 0.16);
+  --danger: #f87171;
+  --danger-soft: rgba(239, 68, 68, 0.16);
+
+  --focus: #8b9cf7;
+  --focus-soft: rgba(99, 91, 255, 0.2);
+
+  --grad-primary: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+  --grad-soft: linear-gradient(135deg, rgba(99, 91, 255, 0.26), rgba(124, 58, 237, 0.2));
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 8px 24px -10px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 24px 48px -18px rgba(0, 0, 0, 0.55);
+  --shadow-glow: 0 8px 22px -10px rgba(124, 134, 246, 0.45);
+}
+
+/* ------------------------------------------------------------
+   Dark — page backdrop + selection + scrollbars
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] body {
+  background: radial-gradient(1200px 600px at 85% -10%, #1c2245 0%, var(--bg) 55%) fixed;
+}
+:root[data-theme='dark'] ::selection {
+  background: rgba(124, 134, 246, 0.35);
+}
+:root[data-theme='dark'] * {
+  scrollbar-color: #3b4567 transparent;
+}
+:root[data-theme='dark'] *::-webkit-scrollbar-thumb {
+  background: #3b4567;
+}
+:root[data-theme='dark'] *::-webkit-scrollbar-thumb:hover {
+  background: #4a5580;
+}
+
+/* ------------------------------------------------------------
+   Dark — layout surfaces
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .topbar {
+  background: rgba(13, 18, 33, 0.78);
+}
+:root[data-theme='dark'] .card-hover:hover {
+  border-color: #3a4468;
+}
+:root[data-theme='dark'] .btn-secondary:hover {
+  border-color: #3a4468;
+}
+:root[data-theme='dark'] .kicker {
+  border-color: rgba(124, 134, 246, 0.35);
+}
+:root[data-theme='dark'] .pill:hover {
+  border-color: #3a4468;
+}
+
+/* ------------------------------------------------------------
+   Dark — buttons, badges, banners
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .btn-accent:hover:not(:disabled) {
+  background: #8b5cf6;
+}
+:root[data-theme='dark'] .btn-danger:hover:not(:disabled) {
+  background: #ef4444;
+}
+:root[data-theme='dark'] .btn-warning:hover:not(:disabled) {
+  background: #f59e0b;
+}
+:root[data-theme='dark'] .btn-ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+:root[data-theme='dark'] .badge-focus {
+  background: var(--focus-soft);
+  color: var(--focus);
+}
+:root[data-theme='dark'] .badge-muted {
+  background: #242c48;
+}
+:root[data-theme='dark'] .banner-info {
+  color: var(--primary);
+}
+:root[data-theme='dark'] .banner-success {
+  color: var(--success);
+}
+:root[data-theme='dark'] .banner-warning {
+  color: var(--warning);
+}
+:root[data-theme='dark'] .banner-danger {
+  color: var(--danger);
+}
+:root[data-theme='dark'] .dash-stat:nth-child(2) .dash-stat-icon {
+  color: var(--focus);
+}
+
+/* ------------------------------------------------------------
+   Dark — progress, skeletons
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .progress-track {
+  background: #2a3250;
+}
+:root[data-theme='dark'] .bar-muted .progress-fill {
+  background: #45506f;
+}
+:root[data-theme='dark'] .skeleton {
+  background: #1b2240;
+}
+:root[data-theme='dark'] .skeleton::after {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.05), transparent);
+}
+
+/* ------------------------------------------------------------
+   Dark — roadmap mock + roadmap page
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .roadmap-mock-header {
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .roadmap-mock-side {
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .roadmap-node.locked .card {
+  background: var(--surface-2);
+}
+
+/* ------------------------------------------------------------
+   Dark — focus mode
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .focus-reader {
+  color: var(--text);
+}
+:root[data-theme='dark'] .focus-timer {
+  background: var(--focus-soft);
+}
+:root[data-theme='dark'] .focus-tab:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+:root[data-theme='dark'] .focus-pos-chip {
+  background: var(--surface);
+}
+
+/* ------------------------------------------------------------
+   Dark — video search, concept chips, ask assistant
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .video-progress {
+  background: #2a3250;
+}
+:root[data-theme='dark'] .concept-chip {
+  border-color: var(--border-strong);
+}
+:root[data-theme='dark'] .ask-msg.assistant .ask-bubble {
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .ask-chip:hover:not(:disabled) {
+  background: rgba(99, 91, 255, 0.28);
+  border-color: rgba(124, 134, 246, 0.45);
+}
+
+/* ------------------------------------------------------------
+   Dark — AI roadmap
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .ai-modal-footer {
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .ai-node-index {
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .ai-node.locked .ai-node-dot {
+  background: #23293f;
+  border-color: #3a4468;
+}
+:root[data-theme='dark'] .ai-node-dot.dot-muted {
+  background: #23293f;
+  border-color: #3a4468;
+}
+:root[data-theme='dark'] .ai-legend-dot.dot-muted,
+:root[data-theme='dark'] .ai-legend-dot.dot-locked {
+  background: #3a4468;
+}
+:root[data-theme='dark'] .ai-node-dot.dot-warning,
+:root[data-theme='dark'] .ai-node.needs-review .ai-node-dot {
+  color: var(--warning);
+}
+:root[data-theme='dark'] .ai-badge-locked {
+  background: #242c48;
+  color: var(--muted);
+}
+:root[data-theme='dark'] .ai-badge-needs-practice {
+  background: rgba(37, 99, 235, 0.25);
+  color: var(--focus);
+}
+:root[data-theme='dark'] .ai-node-card.practice {
+  background: linear-gradient(120deg, rgba(37, 99, 235, 0.18), var(--surface) 65%);
+}
+:root[data-theme='dark'] .ai-phase-head:hover {
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .ai-adapt.adapt-warning .ai-adapt-sub {
+  color: var(--warning);
+}
+:root[data-theme='dark'] .ai-weak-tag {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(251, 191, 36, 0.35);
+  color: var(--warning);
+}
+:root[data-theme='dark'] .ai-streak {
+  background: linear-gradient(120deg, #3a2b12, #4a331c);
+  border-color: rgba(251, 191, 36, 0.3);
+  color: var(--warning);
+}
+:root[data-theme='dark'] .ai-streak svg {
+  color: #fb923c;
+}
+:root[data-theme='dark'] .ai-toast {
+  background: #232b49;
+  color: #f0f2fa;
+}
+
+/* ------------------------------------------------------------
+   Dark — quizzes
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .quiz-option:hover:not(:disabled) {
+  border-color: rgba(124, 134, 246, 0.45);
+  background: var(--surface-2);
+}
+:root[data-theme='dark'] .quiz-option .quiz-radio {
+  border-color: var(--border-strong);
+}
+:root[data-theme='dark'] .quiz-option.correct,
+:root[data-theme='dark'] .quiz-option.correct .quiz-radio {
+  color: var(--success);
+  border-color: var(--success);
+}
+:root[data-theme='dark'] .quiz-option.wrong,
+:root[data-theme='dark'] .quiz-option.wrong .quiz-radio {
+  color: var(--danger);
+  border-color: #ff7b87;
+}
+:root[data-theme='dark'] .quiz-side-panel {
+  background: linear-gradient(170deg, #151b30 0%, #1d1a38 100%);
+}
+:root[data-theme='dark'] .quiz-progress-track {
+  background: #2a3250;
+}
+
+/* ------------------------------------------------------------
+   Dark — performance & analytics
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .perf-ring-track {
+  background: conic-gradient(var(--primary) calc(var(--p, 0) * 1%), #252e4a 0);
+}
+:root[data-theme='dark'] .perf-subject-track {
+  background: #2a3250;
+}
+:root[data-theme='dark'] .perf-timeline::before {
+  background: #2a3250;
+}
+
+/* ------------------------------------------------------------
+   Dark — recommended playlists
+   ------------------------------------------------------------ */
+:root[data-theme='dark'] .rec-playlist-banner {
+  background: linear-gradient(135deg, rgba(99, 91, 255, 0.22), rgba(124, 58, 237, 0.18));
+  border-color: rgba(167, 139, 250, 0.35);
+}
+
+/* ------------------------------------------------------------
+   Theme toggle (segmented control)
+   ------------------------------------------------------------ */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.theme-toggle-option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background-color var(--t-fast), color var(--t-fast), box-shadow var(--t-fast);
+}
+.theme-toggle-option:hover {
+  color: var(--text);
+  background: rgba(18, 23, 42, 0.06);
+}
+.theme-toggle-option.active {
+  background: var(--surface);
+  color: var(--primary);
+  box-shadow: var(--shadow-sm);
+}
+.theme-toggle-option:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--primary-ring);
+}
+:root[data-theme='dark'] .theme-toggle-option:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Auth nav needs flex layout so the toggle can sit on the right. */
+.auth-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ------------------------------------------------------------
+   Subtle theme-switch transition.
+   Merges background/border/color into the transitions surfaces
+   already define (so hover transforms keep working), and is
+   disabled under prefers-reduced-motion (see global.css).
+   ------------------------------------------------------------ */
+@media (prefers-reduced-motion: no-preference) {
+  :root[data-theme] body,
+  :root[data-theme] .app-shell,
+  :root[data-theme] .sidebar,
+  :root[data-theme] .topbar,
+  :root[data-theme] .card,
+  :root[data-theme] .banner,
+  :root[data-theme] .badge,
+  :root[data-theme] .chip,
+  :root[data-theme] .pill,
+  :root[data-theme] .quiz-option,
+  :root[data-theme] .form-group input,
+  :root[data-theme] .form-group textarea,
+  :root[data-theme] .form-group select,
+  :root[data-theme] .input {
+    transition:
+      background-color var(--t-base),
+      border-color var(--t-base),
+      color var(--t-base),
+      box-shadow var(--t-base),
+      transform var(--t-base);
+  }
+}

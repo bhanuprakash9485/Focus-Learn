@@ -2,3 +2,9 @@ yt-dlp
 google-genai
 python-dotenv
 groq
+# Official Google auth library — verifies Firebase ID tokens (RS256) against
+# Google's public certificates for POST /api/auth/firebase. google-genai
+# already depends on google-auth; it is pinned here so the endpoint works even
+# if that changes.
+google-auth
+requests
