@@ -1,0 +1,10 @@
+node_modules
+.git
+.vite
+backend/__pycache__
+backend/data
+**/__pycache__
+backend/test_*.py
+*.log
+.env
+backend/.env

@@ -1,0 +1,8 @@
+# Vercel Python function dependencies (root-level; Vercel reads this file).
+# backend/requirements.txt remains the source for local development.
+flask
+groq
+yt-dlp
+google-genai
+google-auth
+python-dotenv

@@ -88,7 +88,9 @@ def req(method: str, path: str, body=None, use_cookie: bool = True):
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
     if use_cookie and _cookie:
-        headers["Cookie"] = _cookie
+        # Send a real cookie pair — extract_session_token matches the
+        # "fl_session=<token>" name, not a bare token.
+        headers["Cookie"] = f"fl_session={_cookie}"
     conn.request(method, path, body=data, headers=headers)
     resp = conn.getresponse()
     raw = resp.read().decode("utf-8", "replace")
@@ -159,9 +161,10 @@ status, _, _ = req("POST", "/api/auth/signup", {"name": "", "email": "bad", "pas
 check("invalid signup 400", status == 400, f"http {status}")
 
 # 6) Google endpoint behaviors.
-# Missing credential -> 400.
+# Missing credential -> 400 when Google sign-in is configured, 503 when it
+# is not (the configuration gate runs before the credential check).
 status, _, body = req("POST", "/api/auth/google", {})
-check("google missing credential 400", status == 400, f"http {status}")
+check("google missing credential 400/503", status in (400, 503), f"http {status}")
 # Bogus credential -> either 503 (not configured) or 401 (rejected). Must be
 # a controlled safe message, never a raw stack/token echo.
 status, _, body = req("POST", "/api/auth/google", {"credential": "bogus-diag-token"})

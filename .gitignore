@@ -30,3 +30,5 @@ backend/data/
 .DS_Store
 backend/.env.*
 !backend/.env.example
+.vercel
+.env*
