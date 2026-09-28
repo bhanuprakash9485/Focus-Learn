@@ -42,6 +42,7 @@ export default function App() {
         <Route path="/search" element={<VideoSearch />} />
         <Route path="/quiz" element={<Quiz />} />
         <Route path="/quiz/topic/:topic" element={<Quiz />} />
+        <Route path="/quiz/goal/:goalId" element={<Quiz />} />
         <Route path="/quiz/:lessonId" element={<Quiz />} />
         <Route path="/performance" element={<Performance />} />
         <Route path="/knowledge-map" element={<KnowledgeMap />} />

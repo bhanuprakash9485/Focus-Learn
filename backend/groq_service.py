@@ -20,6 +20,7 @@ Requires the ``groq`` package (``pip install -r backend/requirements.txt``).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+import quiz_originality
 
 # Load secrets from a local .env (backend/.env or project root .env) without
 # overriding a real environment variable - an exported GROQ_API_KEY always
@@ -52,6 +55,19 @@ except ImportError:  # pragma: no cover - exercised when the dependency is absen
 # change. Defaults to a high-quality general-purpose text model currently
 # served by the Groq API.
 _MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+# gpt-oss is a REASONING model: on the default "medium" effort it spends a large
+# number of tokens thinking before it writes anything. Writing a multiple-choice
+# question is not a reasoning task, so the quiz calls ask for the cheapest effort
+# level. Measured on a real 30-question run this is the difference between a
+# quiz costing a few thousand tokens and one costing tens of thousands, which
+# matters because Groq's free tier is capped at 200k tokens PER DAY.
+_REASONING_EFFORT = (os.environ.get("GROQ_REASONING_EFFORT") or "low").strip().lower()
+if _REASONING_EFFORT not in ("low", "medium", "high"):
+    _REASONING_EFFORT = ""
+# Flipped off automatically if the provider rejects the parameter, so a model
+# that does not support reasoning_effort still works.
+_REASONING_EFFORT_SUPPORTED = True
 
 ARRAY_FIELDS = frozenset(
     {
@@ -95,6 +111,14 @@ RATE_LIMIT_MESSAGE = (
     "rate limited. Please try again shortly."
 )
 
+# The study planner reuses the same provider, so it needs its own wording —
+# telling a student "quiz preparation" while they are looking at their plan is
+# confusing.
+STUDY_PLAN_RATE_LIMIT_MESSAGE = (
+    "The study assistant is taking a short break because the AI service is "
+    "rate limited. Your existing plan is still here, so try again shortly."
+)
+
 
 def _is_rate_limit(exc: Exception) -> bool:
     """True when the underlying provider reported HTTP 429 (rate limit)."""
@@ -105,6 +129,24 @@ def _is_rate_limit(exc: Exception) -> bool:
     code = str(getattr(exc, "code", "") or "").lower()
     message = str(getattr(exc, "message", "") or "").lower()
     return "ratelimit" in name or "rate_limit" in code or "rate limit" in message
+
+
+def _chat_with_reasoning_effort(client: Groq, **kwargs: Any) -> Any:
+    """Run one chat completion, applying the configured reasoning_effort.
+
+    gpt-oss models reason first; without ``reasoning_effort`` a call can burn
+    its whole token budget thinking before writing any content and take a long
+    time on the free tier. Mirrors the quiz path: if the provider rejects the
+    parameter, a module flag is flipped so every later call skips it (never a
+    repeated-failure retry loop).
+    """
+    global _REASONING_EFFORT_SUPPORTED
+    if _REASONING_EFFORT and _REASONING_EFFORT_SUPPORTED:
+        try:
+            return client.chat.completions.create(reasoning_effort=_REASONING_EFFORT, **kwargs)
+        except Exception:
+            _REASONING_EFFORT_SUPPORTED = False
+    return client.chat.completions.create(**kwargs)
 
 
 def groq_available() -> bool:
@@ -241,7 +283,8 @@ def answer_topic_question(
 
     client = Groq(api_key=_groq_key())
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_reasoning_effort(
+            client,
             model=_MODEL,
             messages=messages,
             temperature=0.7,
@@ -277,7 +320,8 @@ def generate_learning_guide(
 
     client = Groq(api_key=_groq_key())
     try:
-        response = client.chat.completions.create(
+        response = _chat_with_reasoning_effort(
+            client,
             model=_MODEL,
             messages=[
                 {
@@ -824,20 +868,43 @@ def create_roadmap(
 
 
 # ---------------------------------------------------------------------------
-# Topic quiz generation — 30+ validated, topic-specific questions
+# Quiz generation — 10 basic + 10 moderate + 10 difficult per goal/topic
 # ---------------------------------------------------------------------------
 
-# Ordered from easiest to hardest. The frontend relies on this order to show
-# the difficulty progression (basic -> moderate -> advanced).
+# Ordered easiest -> hardest. The quiz UI and the unlock ladder follow this
+# order (basic -> moderate -> difficult/advanced).
 QUIZ_DIFFICULTIES: tuple[str, ...] = ("basic", "moderate", "advanced")
 
-# Default number of questions per topic quiz. Kept as a single knob so the
-# quiz can grow to 40/50/60 without redesigning the pipeline.
-DEFAULT_QUIZ_SIZE = 30
+# Every goal gets exactly 10 questions per difficulty tier.
+QUESTIONS_PER_DIFFICULTY = 10
+OPTIONS_PER_QUESTION = 4
+GOAL_QUIZ_TOTAL = QUESTIONS_PER_DIFFICULTY * len(QUIZ_DIFFICULTIES)
+
+# Retained for backwards compatibility with older callers of this module.
+DEFAULT_QUIZ_SIZE = GOAL_QUIZ_TOTAL
 
 # How many questions the model is asked for in a single call. A smaller batch
-# is more reliable; missing questions are topped up with extra calls.
-_QUIZ_BATCH = 10
+# is more reliable; missing questions are topped up with further calls.
+_QUIZ_BATCH = 5
+
+# Token ceiling for one quiz call. A 5-question batch needs roughly 1.5k; the
+# rest is headroom for a reasoning model that thinks before answering.
+try:
+    _QUIZ_MAX_TOKENS = max(1024, int(os.environ.get("GROQ_QUIZ_MAX_TOKENS") or 3072))
+except ValueError:
+    _QUIZ_MAX_TOKENS = 3072
+
+# Every stored question records where it came from. Nothing copied from an
+# external source is ever stored, so this is always the AI-original marker.
+SOURCE_TYPE_AI_ORIGINAL = "ai_generated_original"
+
+# Bounded retry policy for one generation run. A 429 gets a short retry and
+# one final attempt, then the run stops - no unbounded loops, ever.
+_MAX_RUN_CALLS = 16
+_MAX_RATE_LIMIT_RETRIES = 2
+_RATE_LIMIT_BACKOFF_SECONDS = 2.0
+_RUN_DEADLINE_SECONDS = 150.0
+_MAX_BATCH_ATTEMPTS = 6
 
 _DIFFICULTY_ALIASES = {
     "basic": "basic",
@@ -845,138 +912,257 @@ _DIFFICULTY_ALIASES = {
     "beginner": "basic",
     "foundation": "basic",
     "fundamental": "basic",
+    "simple": "basic",
     "moderate": "moderate",
     "intermediate": "moderate",
     "medium": "moderate",
+    "challenging": "moderate",
     "advanced": "advanced",
     "hard": "advanced",
     "difficult": "advanced",
     "expert": "advanced",
+    "complex": "advanced",
 }
 
-_QUIZ_STOPWORDS = frozenset(
-    {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "of", "to", "in", "on", "at", "by", "for", "with", "about", "into",
-        "from", "as", "and", "or", "not", "no", "yes", "do", "does", "did",
-        "what", "which", "who", "whom", "whose", "when", "where", "why",
-        "how", "this", "that", "these", "those", "it", "its", "they", "them",
-        "their", "there", "here", "you", "your", "we", "our", "us", "can",
-        "could", "should", "would", "will", "shall", "may", "might", "must",
-        "following", "best", "correct", "answer", "statement", "true", "false",
-        "than", "then", "also", "such", "most", "more", "less", "used", "use",
-        "using", "given", "one", "two", "three", "all", "any", "each", "some",
-    }
+# Prompt anchors per tier. They keep each tier asking for genuinely different
+# cognitive work instead of "the same question, but longer".
+_TIER_GUIDE: dict[str, str] = {
+    "basic": (
+        "BASIC questions test definitions, terminology, fundamental concepts, "
+        "basic relationships, simple one-step examples and direct recognition. "
+        "A beginner who just read the topic should answer them without "
+        "extended reasoning. Use short, plain stems."
+    ),
+    "moderate": (
+        "MODERATE questions require real reasoning: apply a concept to a small "
+        "case, compare two approaches, interpret a short snippet or small "
+        "data/example, choose the appropriate technique for a situation, or "
+        "explain why a described behaviour happens. Never make these by "
+        "lengthening a basic question."
+    ),
+    "advanced": (
+        "DIFFICULT questions require multi-step reasoning and deeper "
+        "understanding: trace multi-step work, analyse code or output, debug a "
+        "broken scenario, reason about edge cases, weigh trade-offs between "
+        "plausible designs, or diagnose why a system misbehaves. Difficulty "
+        "must come from the reasoning, never from complicated wording alone."
+    ),
+}
+
+# Rotating anchors so consecutive batches do not ask for the same shape again.
+_TIER_ANGLES: dict[str, tuple[str, ...]] = {
+    "basic": (
+        "definition-and-terminology", "one-step-example", "identify-the-term",
+        "single-fact-recognition", "relationship-between-two-ideas",
+    ),
+    "moderate": (
+        "apply-concept-to-a-scenario", "compare-two-approaches",
+        "choose-the-technique", "interpret-a-small-example",
+        "explain-why-this-happens",
+    ),
+    "advanced": (
+        "multi-step-reasoning", "predict-code-or-output", "debugging-reasoning",
+        "edge-case-analysis", "trade-off-or-design-choice",
+    ),
+}
+
+_TIER_CODE_NOTE = (
+    "Where the topic is a programming topic you may include short code or "
+    "output to reason about. Where it is not, use concrete realistic "
+    "situations, data, systems or decisions instead of code."
+)
+
+# Generic/placeholder questions the pipeline must never store to reach a count.
+_PLACEHOLDER_MARKERS = (
+    "question coming soon",
+    "coming soon",
+    "sample question",
+    "placeholder",
+    "todo",
+    "lorem ipsum",
+    "what is x",
+    "insert question",
+    "add more questions",
+    "n/a",
 )
 
 
-def _significant_words(text: str) -> frozenset[str]:
-    """Content words of a question, used to detect duplicates."""
-    words = re.findall(r"[a-z0-9]+", (text or "").lower())
-    return frozenset(w for w in words if len(w) >= 3 and w not in _QUIZ_STOPWORDS)
+class GenerationBudget:
+    """Bounded call/retry budget for a single quiz generation run.
 
-
-def _is_duplicate_question(key: frozenset[str], existing: list[frozenset[str]]) -> bool:
-    """True when *key* repeats (or nearly repeats) a question already kept."""
-    if not key:
-        return True
-    for other in existing:
-        if key == other:
-            return True
-        # Ignore tiny single-word overlaps (common topic words like "array")
-        # and require a high Jaccard similarity before treating as duplicate.
-        if len(key) < 2 or len(other) < 2:
-            continue
-        shared = len(key & other)
-        if shared < 2:
-            continue
-        union = len(key | other)
-        if union and shared / union >= 0.8:
-            return True
-    return False
-
-
-def _quiz_target_counts(total: int, focus: bool = False) -> dict[str, int]:
-    """Split *total* across the three difficulties, easiest tier first.
-
-    The default (focus=False) split is as even as possible, so the canonical
-    30-question quiz is exactly 10/10/10. A focused retest weights the harder
-    tiers more heavily.
+    Guarantees termination: a run makes at most ``max_calls`` model calls,
+    retries a rate-limited call at most ``max_rate_limit_retries`` times and
+    gives up entirely once ``deadline_seconds`` have elapsed. A 429 therefore
+    never turns into a multi-minute retry loop.
     """
-    total = max(6, int(total))
-    if focus:
-        basic = max(1, round(total * 0.2))
-        advanced = max(1, round(total * 0.4))
-        intermediate = max(1, total - basic - advanced)
-    else:
-        basic = total // 3
-        intermediate = total // 3
-        advanced = total - basic - intermediate
-    return {"basic": basic, "intermediate": intermediate, "advanced": advanced}
+
+    def __init__(
+        self,
+        max_calls: int = _MAX_RUN_CALLS,
+        max_rate_limit_retries: int = _MAX_RATE_LIMIT_RETRIES,
+        deadline_seconds: float = _RUN_DEADLINE_SECONDS,
+        backoff_seconds: float = _RATE_LIMIT_BACKOFF_SECONDS,
+    ) -> None:
+        self.max_calls = max_calls
+        self.max_rate_limit_retries = max_rate_limit_retries
+        self.deadline_seconds = deadline_seconds
+        self.backoff_seconds = backoff_seconds
+        self.calls = 0
+        self.rate_limit_hits = 0
+        self.rate_limit_retries = 0
+        self._started = time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._started
+
+    @property
+    def expired(self) -> bool:
+        return self.elapsed >= self.deadline_seconds
+
+    def can_call(self) -> bool:
+        return self.calls < self.max_calls and not self.expired
+
+    def record_call(self) -> None:
+        self.calls += 1
+
+    def note_rate_limit(self) -> bool:
+        """Register a 429. Returns False when the budget is exhausted."""
+        self.rate_limit_hits += 1
+        if self.rate_limit_retries >= self.max_rate_limit_retries:
+            return False
+        self.rate_limit_retries += 1
+        time.sleep(self.backoff_seconds)
+        return True
+
+    def summary(self) -> dict:
+        return {
+            "calls": self.calls,
+            "rate_limit_hits": self.rate_limit_hits,
+            "rate_limit_retries": self.rate_limit_retries,
+            "elapsed_seconds": round(self.elapsed, 2),
+            "expired": self.expired,
+        }
+
+
+def _looks_like_placeholder(prompt: str) -> bool:
+    """True for filler questions the pipeline must never store."""
+    lowered = f" {prompt.strip().lower()} "
+    return any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+
+
+def _target_correct_position(prompt: str, salt: str = "") -> int:
+    """Deterministic option index (0-3) for the correct answer.
+
+    Derived from the question text so a stored question keeps the same layout
+    forever, while distinct questions spread across A/B/C/D instead of always
+    landing on the same letter.
+    """
+    digest = hashlib.sha256(f"{prompt.strip()}|{salt}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % OPTIONS_PER_QUESTION
+
+
+def _place_correct_option(question: dict, salt: str = "") -> dict:
+    """Move the correct answer to a deterministic slot, keep the rest stable."""
+    options = list(question["options"])
+    correct_text = options[question["correctIndex"]]
+    distractors = [o for i, o in enumerate(options) if i != question["correctIndex"]]
+    position = _target_correct_position(question["prompt"], salt)
+    reordered = distractors[:position] + [correct_text] + distractors[position:]
+    question["options"] = reordered
+    question["correctIndex"] = position
+    return question
+
+
+def validate_question(question: dict, difficulty: str) -> tuple[bool, str]:
+    """Structural validation for one question. Returns (ok, reason)."""
+    prompt = str(question.get("prompt") or "").strip()
+    if len(prompt) < 15:
+        return False, "question too short"
+    if _looks_like_placeholder(prompt):
+        return False, "placeholder question"
+    options = question.get("options")
+    if not isinstance(options, list):
+        return False, "options missing"
+    if len(options) != OPTIONS_PER_QUESTION:
+        return False, f"expected exactly {OPTIONS_PER_QUESTION} options"
+    if any(not str(o).strip() for o in options):
+        return False, "empty option"
+    if len({str(o).strip().lower() for o in options}) != OPTIONS_PER_QUESTION:
+        return False, "duplicate options"
+    correct = question.get("correctIndex")
+    if not isinstance(correct, int) or not (0 <= correct < OPTIONS_PER_QUESTION):
+        return False, "correct answer out of range"
+    if question.get("difficulty") != difficulty:
+        return False, "difficulty mismatch"
+    if len(str(question.get("explanation") or "").strip()) < 10:
+        return False, "explanation missing"
+    return True, ""
 
 
 def _build_quiz_prompt(
     topic: str,
     level: str,
-    counts: dict[str, int],
+    difficulty: str,
+    count: int,
     focus_concepts: list[str],
-    existing_prompts: list[str],
+    avoid_prompts: list[str],
+    goal_context: str,
+    angle: str,
 ) -> str:
-    basic, intermediate, advanced = (
-        counts.get("basic", 0),
-        counts.get("intermediate", 0),
-        counts.get("advanced", 0),
-    )
-    total = basic + intermediate + advanced
-    tier_lines = []
-    if basic:
-        tier_lines.append(
-            f"- {basic} BASIC questions: definitions, terminology, fundamental concepts, "
-            "simple examples, direct recognition."
-        )
-    if intermediate:
-        tier_lines.append(
-            f"- {intermediate} MODERATE questions: applying concepts, tracing simple "
-            "logic, comparing approaches, small problems."
-        )
-    if advanced:
-        tier_lines.append(
-            f"- {advanced} ADVANCED questions: multi-step reasoning, edge cases, complexity "
-            "or trade-off analysis, harder scenarios."
-        )
     focus_block = ""
     if focus_concepts:
         focus_block = (
-            "\nThe student was flagged for these weak concepts — every question MUST "
-            "directly test one of them:\n- " + "\n- ".join(focus_concepts) + "\n"
+            "\nThe student is weak on these concepts - every question must "
+            "directly test one of them:\n- "
+            + "\n- ".join(focus_concepts)
+            + "\n"
+        )
+    context_block = ""
+    if goal_context:
+        context_block = (
+            "\nLEARNING CONTEXT (use it to keep every question on-goal, do not "
+            "quote it back):\n" + goal_context[:1500] + "\n"
         )
     avoid_block = ""
-    if existing_prompts:
+    if avoid_prompts:
         avoid_block = (
-            "\nDo NOT repeat or rephrase any of these already-written questions:\n- "
-            + "\n- ".join(existing_prompts[:40])
+            "\nALREADY WRITTEN - do not repeat or rephrase any of these "
+            "questions; cover different ground instead:\n- "
+            + "\n- ".join(avoid_prompts[:40])
             + "\n"
         )
     return (
-        "You are FocusLearn's quiz author. Write multiple-choice questions about the "
-        "EXACT topic below and nothing else.\n\n"
-        f"TOPIC: {topic}\n"
+        "You are FocusLearn's quiz author. You write NEW, original multiple-choice "
+        "questions about the EXACT goal/topic below and nothing else.\n\n"
+        f"GOAL / TOPIC: {topic}\n"
         f"STUDENT LEVEL: {level}\n"
-        f"{focus_block}{avoid_block}\n"
-        f"Write EXACTLY {total} questions with this difficulty spread:\n"
-        + "\n".join(tier_lines)
-        + "\n\n"
-        "Quality rules:\n"
-        "- Every question must be genuinely specific to the topic (no filler, no "
-        "off-topic or generic study questions).\n"
-        "- Each question has exactly 4 options and exactly ONE correct answer.\n"
-        "- Vary which option index is correct; do not always use the same position.\n"
-        "- Every question must test a different concept — no duplicates or rephrasings.\n"
-        "- 'concept' must be a short subtopic label (e.g. 'Tree Traversal').\n"
-        "- 'explanation' must briefly justify the correct answer.\n"
-        "- Do not use trick or ambiguous questions.\n\n"
-        "Return ONLY valid JSON (no markdown fences, no commentary) matching EXACTLY:\n"
-        "{\n"
+        f"QUESTIONS TO WRITE NOW: {count}\n"
+        f"DIFFICULTY TIER: {difficulty.upper()}\n"
+        f"{context_block}{focus_block}{avoid_block}\n"
+        f"{_TIER_GUIDE.get(difficulty, _TIER_GUIDE['basic'])}\n"
+        f"Mix question shapes. This batch should emphasise: {angle}.\n"
+        f"{_TIER_CODE_NOTE}\n\n"
+        "ORIGINALITY RULES (mandatory):\n"
+        "- Invent fresh wording and fresh scenarios. Never reproduce a question "
+        "you have seen in a book, course, exam paper, question bank, tutorial "
+        "website, video or an earlier AI answer.\n"
+        "- Do not use one repeated sentence pattern with swapped nouns; each "
+        "question should read differently from its neighbours.\n"
+        "- Test different subtopics within the tier; no two questions may ask "
+        "the same thing in different words.\n\n"
+        "QUESTION RULES (mandatory):\n"
+        f"- Exactly {OPTIONS_PER_QUESTION} options per question (A, B, C, D) and "
+        "exactly ONE correct answer.\n"
+        "- Every distractor must be plausible for someone who half-knows the "
+        "topic - no silly or obviously wrong filler.\n"
+        "- Spread the correct option across A/B/C/D; do not favour one letter.\n"
+        "- 'concept' is a short subtopic label used for weak-area analysis.\n"
+        "- 'explanation' must state WHY the correct answer is correct (1-2 "
+        "sentences, original wording).\n"
+        "- No trick wording, no ambiguity, no 'all of the above'.\n\n"
+        "Return ONLY valid JSON (no markdown fences, no commentary):\n"
+        '{\n'
         '  "topic": string,\n'
         '  "questions": [\n'
         "    {\n"
@@ -993,12 +1179,11 @@ def _build_quiz_prompt(
 
 
 def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
-    """Parse Groq output into validated question dicts (drops invalid rows)."""
+    """Parse a model response into question dicts (invalid rows are dropped)."""
     text = re.sub(r"^```(?:json)?\s*", "", (raw or "").strip())
     text = re.sub(r"\s*```$", "", text)
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
-        # Some models return a bare JSON array.
         a_start, a_end = text.find("["), text.rfind("]")
         if a_start == -1 or a_end <= a_start:
             raise ValueError("The quiz response could not be read as JSON.")
@@ -1021,7 +1206,7 @@ def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
         if not isinstance(raw_options, list):
             continue
         options = [str(o).strip() for o in raw_options if str(o).strip()]
-        if len(options) < 2:
+        if len(options) < OPTIONS_PER_QUESTION:
             continue
 
         raw_index = item.get(
@@ -1031,7 +1216,7 @@ def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
         try:
             correct = int(raw_index)
         except (TypeError, ValueError):
-            # Some models return the correct option's *text* or *letter* instead of an index.
+            # Some models return the correct option's text or letter instead.
             if isinstance(raw_index, str):
                 letter = raw_index.strip().upper()
                 if len(letter) == 1 and "A" <= letter <= "F":
@@ -1043,11 +1228,7 @@ def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
             else:
                 continue
         if not (0 <= correct < len(options)):
-            # Tolerate 1-based answers (1..len).
-            if 1 <= correct <= len(options):
-                correct -= 1
-            else:
-                continue
+            continue
 
         difficulty = _DIFFICULTY_ALIASES.get(
             str(item.get("difficulty") or "").strip().lower(), ""
@@ -1055,17 +1236,19 @@ def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
         if not difficulty:
             continue
 
-        concept = str(item.get("concept") or "").strip()[:80] or topic
-        explanation = str(item.get("explanation") or "").strip()
-        if not explanation:
-            explanation = f"The correct answer follows from the definition of {concept}."
+        # Keep exactly 4 options, always preserving the correct answer.
+        if len(options) > OPTIONS_PER_QUESTION:
+            distractors = [o for i, o in enumerate(options) if i != correct]
+            options = [options[correct]] + distractors[: OPTIONS_PER_QUESTION - 1]
+            correct = 0
 
+        concept = str(item.get("concept") or "").strip()[:80] or topic
         questions.append(
             {
                 "prompt": prompt[:600],
-                "options": [o[:300] for o in options[:6]],
+                "options": [o[:300] for o in options],
                 "correctIndex": correct,
-                "explanation": explanation[:600],
+                "explanation": str(item.get("explanation") or "").strip()[:600],
                 "difficulty": difficulty,
                 "concept": concept,
             }
@@ -1076,72 +1259,216 @@ def _coerce_quiz_questions(raw: str, topic: str) -> list[dict]:
 def _quiz_call(
     topic: str,
     level: str,
-    counts: dict[str, int],
+    difficulty: str,
+    count: int,
     focus_concepts: list[str],
-    existing_prompts: list[str],
+    avoid_prompts: list[str],
+    goal_context: str = "",
+    angle: str = "",
+    budget: GenerationBudget | None = None,
 ) -> list[dict]:
-    """One Groq call for a batch of questions. Returns [] on a bad payload."""
+    """One bounded Groq call for a single difficulty tier."""
+    budget = budget or GenerationBudget()
+    if not budget.can_call():
+        return []
     client = Groq(api_key=_groq_key())
     messages = [
         {
             "role": "system",
-            "content": "You are FocusLearn's quiz author. "
-            "Output valid JSON only, with no extra text.",
+            "content": (
+                "You are FocusLearn's quiz author. You only ever write new, "
+                "original questions. Output valid JSON only, with no extra text."
+            ),
         },
         {
             "role": "user",
-            "content": _build_quiz_prompt(topic, level, counts, focus_concepts, existing_prompts),
+            "content": _build_quiz_prompt(
+                topic,
+                level,
+                difficulty,
+                count,
+                focus_concepts,
+                avoid_prompts,
+                goal_context,
+                angle or _TIER_ANGLES.get(difficulty, ("",))[0],
+            ),
         },
     ]
+
+    def _create(structured: bool, with_reasoning_effort: bool = True) -> str:
+        budget.record_call()
+        kwargs = {
+            "model": _MODEL,
+            "messages": messages,
+            "temperature": 0.85,
+            # A 5-question batch of short stems, options and explanations fits
+            # comfortably; 8192 was pure headroom that a reasoning model will
+            # happily spend on thinking.
+            "max_tokens": _QUIZ_MAX_TOKENS,
+        }
+        if structured:
+            kwargs["response_format"] = {"type": "json_object"}
+        if with_reasoning_effort and _REASONING_EFFORT and _REASONING_EFFORT_SUPPORTED:
+            kwargs["reasoning_effort"] = _REASONING_EFFORT
+        response = client.chat.completions.create(**kwargs)
+        return (response.choices[0].message.content if response.choices else None) or ""
+
     content = ""
-    # One structured attempt. On 429 we retry exactly once after a short
-    # pause (a bounded policy), then stop immediately — never loop indefinitely.
     try:
-        response = client.chat.completions.create(
-            model=_MODEL,
-            messages=messages,
-            temperature=0.6,
-            max_tokens=8192,
-            response_format={"type": "json_object"},
-        )
-        content = (response.choices[0].message.content if response.choices else None) or ""
+        content = _create(True)
     except Exception as exc:
         if _is_rate_limit(exc):
-            time.sleep(2.0)
+            # Bounded retry: one short pause, one more attempt, then stop.
+            if not budget.note_rate_limit():
+                raise QuizRateLimitError(RATE_LIMIT_MESSAGE) from exc
+            if not budget.can_call():
+                raise QuizRateLimitError(RATE_LIMIT_MESSAGE) from exc
             try:
-                response = client.chat.completions.create(
-                    model=_MODEL,
-                    messages=messages,
-                    temperature=0.6,
-                    max_tokens=8192,
-                    response_format={"type": "json_object"},
-                )
-                content = (response.choices[0].message.content if response.choices else None) or ""
+                content = _create(True)
             except Exception as exc2:
-                if _is_rate_limit(exc2) or _is_rate_limit(exc):
+                if _is_rate_limit(exc2):
                     raise QuizRateLimitError(RATE_LIMIT_MESSAGE) from exc2
                 raise RuntimeError(
                     "Quiz generation is temporarily unavailable. Please try again."
                 ) from exc2
         else:
-            # The model occasionally fails strict JSON validation in json_object
-            # mode; retry once without it and parse the text ourselves.
-            try:
-                response = client.chat.completions.create(
-                    model=_MODEL,
-                    messages=messages,
-                    temperature=0.6,
-                    max_tokens=8192,
-                )
-                content = (response.choices[0].message.content if response.choices else None) or ""
-            except Exception:
+            # Bounded fallbacks, cheapest reason first:
+            #  1. this model may not accept reasoning_effort at all;
+            #  2. strict JSON mode can fail, in which case we parse the text.
+            # An empty response is NOT an error here: a reasoning model can
+            # spend the whole token budget thinking, and the caller's bounded
+            # loop simply asks again with a different angle.
+            if not budget.can_call():
                 raise RuntimeError(
                     "Quiz generation is temporarily unavailable. Please try again."
                 ) from exc
+            global _REASONING_EFFORT_SUPPORTED
+            try:
+                content = _create(True, with_reasoning_effort=False)
+                _REASONING_EFFORT_SUPPORTED = False
+            except Exception:
+                if not budget.can_call():
+                    raise RuntimeError(
+                        "Quiz generation is temporarily unavailable. Please try again."
+                    ) from exc
+                try:
+                    content = _create(False, with_reasoning_effort=False)
+                except Exception as exc2:
+                    raise RuntimeError(
+                        "Quiz generation is temporarily unavailable. Please try again."
+                    ) from exc2
     try:
         return _coerce_quiz_questions(content, topic)
     except ValueError:
         return []
+
+
+def generate_quiz_tier(
+    topic: str,
+    difficulty: str,
+    level: str = "beginner",
+    count: int = QUESTIONS_PER_DIFFICULTY,
+    focus_concepts: list[str] | None = None,
+    avoid_prompts: list[str] | None = None,
+    goal_context: str = "",
+    budget: GenerationBudget | None = None,
+) -> list[dict]:
+    """Generate up to *count* validated, original questions for ONE tier.
+
+    Every returned question has exactly 4 options, exactly one correct answer,
+    a deterministic (shuffled) correct-answer position, an original explanation
+    and has passed the duplicate / near-duplicate check against
+    *avoid_prompts* (previously written or stored questions) and against the
+    other questions of this batch.
+
+    Returns fewer than *count* questions only when the bounded budget runs out
+    (rate limit / model error) - the caller decides what to do with the gap and
+    never stores a filler question to fill it.
+    """
+    if not groq_available():
+        raise GroqConfigurationError(
+            "groq is not installed. Run: pip install -r backend/requirements.txt"
+        )
+    if not _groq_key():
+        raise GroqConfigurationError("Groq API key is not configured.")
+
+    difficulty = _DIFFICULTY_ALIASES.get((difficulty or "").strip().lower(), "")
+    if not difficulty:
+        raise RuntimeError("Unknown quiz difficulty tier.")
+    topic = (topic or "").strip()[:200]
+    if not topic:
+        raise RuntimeError("A topic is required to generate a quiz.")
+    level = (level or "beginner").strip()[:20] or "beginner"
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        count = QUESTIONS_PER_DIFFICULTY
+    count = max(1, min(count, 20))
+
+    budget = budget or GenerationBudget()
+    guard = quiz_originality.OriginalityGuard(existing=avoid_prompts or [])
+    angles = _TIER_ANGLES.get(difficulty, ("",))
+    accepted: list[dict] = []
+    attempts = 0
+
+    while len(accepted) < count and attempts < _MAX_BATCH_ATTEMPTS:
+        attempts += 1
+        if not budget.can_call():
+            break
+        need = count - len(accepted)
+        batch = _quiz_call(
+            topic=topic,
+            level=level,
+            difficulty=difficulty,
+            count=min(need + 1, _QUIZ_BATCH),
+            focus_concepts=focus_concepts or [],
+            avoid_prompts=list(avoid_prompts or []) + [q["prompt"] for q in accepted],
+            goal_context=goal_context,
+            angle=angles[(attempts - 1) % len(angles)] if angles else "",
+            budget=budget,
+        )
+        added = 0
+        for question in batch:
+            if question.get("difficulty") != difficulty:
+                continue
+            if len(accepted) >= count:
+                break
+            ok, _reason = validate_question(question, difficulty)
+            if not ok:
+                continue
+            # Reject duplicates / near-duplicates; a replacement is requested
+            # by the loop below instead of storing a repeat.
+            if not guard.add(question["prompt"]):
+                continue
+            accepted.append(_place_correct_option(question, salt=difficulty))
+            added += 1
+        if added == 0 and not batch:
+            continue
+    return accepted
+
+
+def _tier_counts(total: int) -> dict[str, int]:
+    """Even 3-way split of *total* (30 -> 10/10/10)."""
+    total = max(len(QUIZ_DIFFICULTIES), min(int(total), 60))
+    basic = total // 3
+    moderate = total // 3
+    return {
+        "basic": basic,
+        "moderate": moderate,
+        "advanced": total - basic - moderate,
+    }
+
+
+def _order_questions(collected: dict[str, list[dict]], counts: dict[str, int]) -> list[dict]:
+    """Flatten tiers easiest-first with tier-scoped ids (basic-1..10, ...)."""
+    ordered: list[dict] = []
+    positions: dict[str, int] = {d: 0 for d in QUIZ_DIFFICULTIES}
+    for difficulty in QUIZ_DIFFICULTIES:
+        for question in collected.get(difficulty, [])[: counts.get(difficulty, 0)]:
+            positions[difficulty] += 1
+            question["id"] = f"{difficulty}-{positions[difficulty]}"
+            ordered.append(question)
+    return ordered
 
 
 def generate_topic_quiz(
@@ -1150,13 +1477,11 @@ def generate_topic_quiz(
     total: int = DEFAULT_QUIZ_SIZE,
     focus_concepts: list[str] | None = None,
 ) -> dict:
-    """Generate and validate a topic quiz with at least *total* questions.
+    """Generate a full quiz tier by tier (10 basic / 10 moderate / 10 difficult).
 
-    The result is ordered easiest-first and guaranteed to contain the full
-    requested difficulty spread (10/10/10 by default). Missing questions are
-    topped up with extra Groq calls; a malformed batch is retried. Raises
-    ``GroqConfigurationError`` when Groq is unconfigured and ``RuntimeError``
-    when a complete, valid quiz could not be produced.
+    Kept for the stateless ``POST /api/ai/generate-quiz`` endpoint. Tiers are
+    generated and validated independently, so a later failure never discards
+    the questions already produced.
     """
     if not groq_available():
         raise GroqConfigurationError(
@@ -1168,79 +1493,46 @@ def generate_topic_quiz(
     topic = (topic or "").strip()[:200]
     if not topic:
         raise RuntimeError("A topic is required to generate a quiz.")
-    level = (level or "beginner").strip()[:20] or "beginner"
     try:
         total = int(total)
     except (TypeError, ValueError):
         total = DEFAULT_QUIZ_SIZE
-    total = max(6, min(total, 60))
-
     focus_concepts = [
         str(c).strip()[:80] for c in (focus_concepts or []) if str(c).strip()
     ][:12]
-    counts = _quiz_target_counts(total, focus=bool(focus_concepts))
+    counts = _tier_counts(total)
+    budget = GenerationBudget()
+    guard = quiz_originality.OriginalityGuard()
 
-    collected: list[dict] = []
-    keys: list[frozenset[str]] = []
-
-    def count_for(difficulty: str) -> int:
-        return sum(1 for q in collected if q["difficulty"] == difficulty)
-
-    def ingest(items: list[dict]) -> None:
-        for q in items:
-            difficulty = q["difficulty"]
-            if count_for(difficulty) >= counts[difficulty]:
-                continue
-            key = _significant_words(q["prompt"])
-            if _is_duplicate_question(key, keys):
-                continue
-            collected.append(q)
-            keys.append(key)
-
-    # Generate tier by tier, in small batches, so no single call has to return
-    # the whole quiz (large JSON responses get truncated by the model).
+    collected: dict[str, list[dict]] = {d: [] for d in QUIZ_DIFFICULTIES}
     for difficulty in QUIZ_DIFFICULTIES:
-        attempts = 0
-        while count_for(difficulty) < counts[difficulty] and attempts < 4:
-            attempts += 1
-            need = counts[difficulty] - count_for(difficulty)
-            batch = min(need, _QUIZ_BATCH)
-            existing_prompts = [q["prompt"] for q in collected]
-            before = count_for(difficulty)
-            try:
-                ingest(
-                    _quiz_call(
-                        topic,
-                        level,
-                        {difficulty: batch},
-                        focus_concepts,
-                        existing_prompts,
-                    )
-                )
-            except GroqConfigurationError:
-                raise
-            except QuizRateLimitError:
-                # Stop this generation run immediately - never hammer a 429.
-                raise
-            except RuntimeError:
-                continue
-            if count_for(difficulty) == before:
-                # No usable questions came back for this tier; stop retrying it.
-                break
-
-    ordered: list[dict] = []
-    for difficulty in QUIZ_DIFFICULTIES:
-        ordered.extend(
-            [q for q in collected if q["difficulty"] == difficulty][: counts[difficulty]]
+        produced = generate_quiz_tier(
+            topic=topic,
+            difficulty=difficulty,
+            level=level,
+            count=counts[difficulty],
+            focus_concepts=focus_concepts,
+            avoid_prompts=[q["prompt"] for block in collected.values() for q in block],
+            budget=budget,
         )
+        for question in produced:
+            if guard.add(question["prompt"]):
+                collected[difficulty].append(question)
+
+    ordered = _order_questions(collected, counts)
     if len(ordered) < total:
         raise RuntimeError(
-            "The AI could not produce a complete quiz with the required difficulty "
-            "spread. Please try again."
+            "The AI could not produce a complete quiz with the required "
+            "difficulty spread. Please try again."
         )
-    for index, question in enumerate(ordered, start=1):
-        question["id"] = f"q{index}"
-    return {"topic": topic, "level": level, "total": len(ordered), "questions": ordered}
+    return {
+        "topic": topic,
+        "level": level,
+        "total": len(ordered),
+        "source_type": SOURCE_TYPE_AI_ORIGINAL,
+        "questions": ordered,
+        "generation": budget.summary(),
+    }
 
 
 def generate_parallel_topic_quiz(
@@ -1248,13 +1540,13 @@ def generate_parallel_topic_quiz(
     level: str = "beginner",
     total: int = DEFAULT_QUIZ_SIZE,
     focus_concepts: list[str] | None = None,
+    goal_context: str = "",
 ) -> dict:
-    """Generate a topic quiz using three CONCURRENT difficulty batches.
+    """Generate the three difficulty tiers in PARALLEL and combine them.
 
-    Requests 10 basic / 10 moderate / 10 advanced in parallel (three Groq
-    calls total, never one per question), then de-duplicates across tiers,
-    tops up any tier that came back short, and returns the combined quiz
-    ordered basic -> moderate -> advanced.
+    Three bounded workers (one per tier) run under a shared budget; each tier
+    is validated and de-duplicated against the others, so the result is
+    always 10 basic + 10 moderate + 10 difficult when generation succeeds.
     """
     if not groq_available():
         raise GroqConfigurationError(
@@ -1266,118 +1558,222 @@ def generate_parallel_topic_quiz(
     topic = (topic or "").strip()[:200]
     if not topic:
         raise RuntimeError("A topic is required to generate a quiz.")
-    level = (level or "beginner").strip()[:20] or "beginner"
     try:
         total = int(total)
     except (TypeError, ValueError):
         total = DEFAULT_QUIZ_SIZE
-    total = max(9, min(total, 60))
-
     focus_concepts = [
         str(c).strip()[:80] for c in (focus_concepts or []) if str(c).strip()
     ][:12]
+    counts = _tier_counts(total)
+    budget = GenerationBudget()
 
-    # Even 3-way split (10/10/10 for the default 30).
-    basic = total // 3
-    moderate = total // 3
-    advanced = total - basic - moderate
-    counts = {"basic": basic, "moderate": moderate, "advanced": advanced}
-
-    # Thread-safe cross-tier duplicate guard.
+    # Cross-tier duplicate guard shared by the parallel workers.
     lock = threading.Lock()
-    global_keys: list[frozenset[str]] = []
+    guard = quiz_originality.OriginalityGuard()
 
-    def prompt_counts(difficulty: str, n: int) -> dict[str, int]:
-        """Map a tier name to the prompt's basic/intermediate/advanced keys."""
-        base = {"basic": 0, "intermediate": 0, "advanced": 0}
-        key = "intermediate" if difficulty == "moderate" else difficulty
-        base[key] = n
-        return base
-
-    def worker(difficulty: str, target: int) -> list[dict]:
-        items: list[dict] = []
-        attempts = 0
-        while len(items) < target and attempts < 4:
-            attempts += 1
-            need = target - len(items)
-            batch_existing = [q["prompt"] for q in items]
-            try:
-                batch = _quiz_call(
-                    topic,
-                    level,
-                    prompt_counts(difficulty, min(need, _QUIZ_BATCH)),
-                    focus_concepts,
-                    batch_existing,
-                )
-            except GroqConfigurationError:
-                raise
-            except QuizRateLimitError:
-                # Stop this generation run immediately - never hammer a 429.
-                raise
-            except RuntimeError:
-                continue
-            for q in batch:
-                if q["difficulty"] != difficulty:
+    def worker(difficulty: str) -> list[dict]:
+        produced = generate_quiz_tier(
+            topic=topic,
+            difficulty=difficulty,
+            level=level,
+            count=counts[difficulty],
+            focus_concepts=focus_concepts,
+            goal_context=goal_context,
+            budget=budget,
+        )
+        kept: list[dict] = []
+        for question in produced:
+            with lock:
+                if not guard.add(question["prompt"]):
                     continue
-                key = _significant_words(q["prompt"])
-                with lock:
-                    if _is_duplicate_question(key, global_keys):
-                        continue
-                    global_keys.append(key)
-                items.append(q)
-        return items
+            kept.append(question)
+        return kept
 
     collected: dict[str, list[dict]] = {d: [] for d in QUIZ_DIFFICULTIES}
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(worker, d, counts[d]): d for d in QUIZ_DIFFICULTIES
+            executor.submit(worker, d): d for d in QUIZ_DIFFICULTIES
         }
         for future, difficulty in futures.items():
             collected[difficulty] = future.result()
 
-    # Top up any tier still short after cross-tier de-duplication.
-    for difficulty in QUIZ_DIFFICULTIES:
-        for _ in range(3):
-            if len(collected[difficulty]) >= counts[difficulty]:
-                break
-            need = counts[difficulty] - len(collected[difficulty])
-            existing = [q["prompt"] for block in collected.values() for q in block]
-            try:
-                batch = _quiz_call(
-                    topic,
-                    level,
-                    prompt_counts(difficulty, min(need, _QUIZ_BATCH)),
-                    focus_concepts,
-                    existing,
-                )
-            except GroqConfigurationError:
-                raise
-            except QuizRateLimitError:
-                # Stop this generation run immediately - never hammer a 429.
-                raise
-            except RuntimeError:
-                continue
-            for q in batch:
-                if q["difficulty"] != difficulty:
-                    continue
-                key = _significant_words(q["prompt"])
-                if _is_duplicate_question(key, global_keys):
-                    continue
-                global_keys.append(key)
-                collected[difficulty].append(q)
-
-    ordered: list[dict] = []
-    for difficulty in QUIZ_DIFFICULTIES:
-        ordered.extend(collected[difficulty][: counts[difficulty]])
+    ordered = _order_questions(collected, counts)
     if len(ordered) < total:
         raise RuntimeError(
-            "The AI could not produce a complete quiz with the required difficulty "
-            "spread. Please try again."
+            "The AI could not produce a complete quiz with the required "
+            "difficulty spread. Please try again."
         )
-    # Tier-scoped ids (basic-1..10, moderate-1..10, advanced-1..10) so the
-    # frontend and review screens can address questions by tier + position.
-    positions: dict[str, int] = {d: 0 for d in QUIZ_DIFFICULTIES}
-    for question in ordered:
-        positions[question["difficulty"]] += 1
-        question["id"] = f"{question['difficulty']}-{positions[question['difficulty']]}"
-    return {"topic": topic, "level": level, "total": len(ordered), "questions": ordered}
+    return {
+        "topic": topic,
+        "level": level,
+        "total": len(ordered),
+        "source_type": SOURCE_TYPE_AI_ORIGINAL,
+        "questions": ordered,
+        "generation": budget.summary(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Adaptive study planner — orders the student's REAL work, invents nothing
+# ---------------------------------------------------------------------------
+
+# Priorities the planner may assign. Priority never changes question difficulty;
+# it only decides what is shown first.
+_STUDY_PRIORITIES = ("high", "medium", "low")
+# A day is never planned beyond this, whatever the AI asks for.
+_STUDY_MAX_DAY_MINUTES = 240
+_STUDY_MAX_TASKS = 14
+_STUDY_MIN_TASK_MINUTES = 5
+
+
+def _build_study_plan_prompt(context: dict) -> str:
+    """Render the student's real state into a planner prompt.
+
+    The candidate list is the complete set of things the planner is allowed to
+    schedule. Anything the model returns that is not in this list is discarded
+    by ``_coerce_study_plan`` — the AI can order real work, it cannot invent it.
+    """
+    candidates = context.get("candidates") or []
+    lines = []
+    for c in candidates:
+        prereq = ", ".join(c.get("prerequisites") or []) or "none"
+        lines.append(
+            f"- ref={c.get('ref')} | kind={c.get('kind')} | {c.get('minutes')} min | "
+            f"step={c.get('step')} | requires=[{prereq}] | title={c.get('title')}"
+        )
+    attempts = context.get("quiz_attempts") or []
+    attempt_text = (
+        ", ".join(f"{a.get('topic')} {a.get('percentage')}%" for a in attempts[:15]) or "none yet"
+    )
+    completed = context.get("completed_lesson_ids") or []
+    return (
+        "You are FocusLearn's study planner. You decide what a student should study "
+        "today and for the rest of their week.\n\n"
+        f"GOAL: {context.get('goal') or 'general learning'}\n"
+        f"TODAY: {context.get('today')}\n"
+        f"DAILY TARGET: {context.get('daily_target_minutes')} minutes (never exceed it per day)\n"
+        f"TARGET DATE: {context.get('target_date') or 'not set'}\n"
+        f"MISSED SESSIONS SO FAR: {context.get('missed_count', 0)}\n"
+        f"ALREADY FINISHED ({len(completed)}): {', '.join(map(str, completed[:40])) or 'none'}\n"
+        f"QUIZ RESULTS (real): {attempt_text}\n"
+        f"WEAK TOPICS (real missed questions): {', '.join(context.get('weak_topics') or []) or 'none'}\n\n"
+        "CANDIDATE TASKS (you may ONLY use these refs, exactly as written):\n"
+        + ("\n".join(lines) or "- (none)")
+        + "\n\n"
+        "Rules:\n"
+        "1. Only return refs from the candidate list. Never invent a topic.\n"
+        "2. Never schedule a task before its prerequisites are finished, unless the "
+        "prerequisite is also in the same day before it.\n"
+        "3. If a quiz score was under 60%, put a review or retake of that topic first.\n"
+        "4. Respect the daily target: the minutes for one day must not exceed it.\n"
+        "5. If everything is finished, return an empty list.\n\n"
+        'Return ONLY valid JSON: {"summary": "one short sentence", "tasks": '
+        '[{"ref": "...", "minutes": 15, "priority": "high", "reason": "one short '
+        'sentence based on the real data above"}]}'
+    )
+
+
+def _coerce_study_plan(raw: str, context: dict) -> dict:
+    """Parse the model's plan, keeping only tasks that map to real candidates."""
+    text = re.sub(r"^```(?:json)?\s*", "", (raw or "").strip())
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return {"summary": "", "tasks": []}
+    try:
+        data = json.loads(text[start : end + 1])
+    except ValueError:
+        return {"summary": "", "tasks": []}
+    if not isinstance(data, dict):
+        return {"summary": "", "tasks": []}
+
+    known = {str(c.get("ref")): c for c in (context.get("candidates") or []) if c.get("ref")}
+    try:
+        daily_target = int(context.get("daily_target_minutes") or 0)
+    except (TypeError, ValueError):
+        daily_target = 0
+    cap = min(daily_target or 30, _STUDY_MAX_DAY_MINUTES)
+
+    tasks: list[dict] = []
+    used_refs: set[str] = set()
+    for item in data.get("tasks") or []:
+        if not isinstance(item, dict) or len(tasks) >= _STUDY_MAX_TASKS:
+            continue
+        ref = str(item.get("ref") or "").strip()
+        # Anything outside the student's real candidate list is dropped.
+        candidate = known.get(ref)
+        if not candidate or ref in used_refs:
+            continue
+        try:
+            minutes = int(item.get("minutes"))
+        except (TypeError, ValueError):
+            minutes = int(candidate.get("minutes") or cap)
+        minutes = max(_STUDY_MIN_TASK_MINUTES, min(minutes, cap))
+        priority = str(item.get("priority") or "").strip().lower()
+        if priority not in _STUDY_PRIORITIES:
+            priority = "medium"
+        reason = str(item.get("reason") or "").strip()[:200]
+        used_refs.add(ref)
+        tasks.append(
+            {
+                "kind": str(candidate.get("kind") or "lesson"),
+                "ref": ref,
+                "title": str(candidate.get("title") or ref)[:120],
+                "estimatedMinutes": minutes,
+                "priority": priority,
+                "reason": reason or "Recommended for today",
+            }
+        )
+    summary = str(data.get("summary") or "").strip()[:240]
+    return {"summary": summary, "tasks": tasks}
+
+
+def build_study_plan(context: dict) -> dict:
+    """Ask Groq to order the student's real remaining work.
+
+    Raises ``GroqConfigurationError`` when the AI is not configured and
+    ``QuizRateLimitError`` on a 429, so the caller can fall back to the
+    deterministic planner instead of showing an empty plan.
+    """
+    if not groq_available():
+        raise GroqConfigurationError(
+            "groq is not installed. Run: pip install -r backend/requirements.txt"
+        )
+    if not _groq_key():
+        raise GroqConfigurationError("Groq API key is not configured.")
+    if not (context.get("candidates") or []):
+        return {"summary": "", "tasks": []}
+
+    client = Groq(api_key=_groq_key())
+    kwargs: dict = {
+        "model": _MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are FocusLearn's study planner. Use only the real data you are "
+                    "given. Output valid JSON only."
+                ),
+            },
+            {"role": "user", "content": _build_study_plan_prompt(context)},
+        ],
+        "temperature": 0.5,
+        "max_tokens": 2048,
+        "response_format": {"type": "json_object"},
+    }
+    if _REASONING_EFFORT and _REASONING_EFFORT_SUPPORTED:
+        # Planning is a light task; do not spend the daily token budget thinking.
+        kwargs["reasoning_effort"] = _REASONING_EFFORT
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        if _is_rate_limit(exc):
+            raise QuizRateLimitError(STUDY_PLAN_RATE_LIMIT_MESSAGE) from exc
+        raise RuntimeError("The study assistant is unavailable right now.") from exc
+
+    content = (response.choices[0].message.content if response.choices else None) or ""
+    plan = _coerce_study_plan(content, context)
+    if not plan["tasks"]:
+        raise RuntimeError("The study assistant did not return a usable plan.")
+    return plan

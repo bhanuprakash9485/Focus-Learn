@@ -19,6 +19,9 @@ import type {
   GoalInput,
   QuizAttempt,
   Roadmap,
+  StudyPlanPreview,
+  StudyPlanState,
+  StudyTask,
   User,
   UserGoal,
   YouTubeVideo,
@@ -28,6 +31,7 @@ import { goals as goalCatalog } from '../data/goals'
 import { getRoadmapForGoal } from '../data/roadmaps'
 import { authApi } from '../services/auth'
 import { goalsApi, GoalError } from '../services/goals'
+import { reduceStudyPlan } from '../services/studyPlan'
 
 /** Legacy single-writer key ("guest" / pre-auth state). */
 const GUEST_STORAGE_KEY = 'focuslearn-state-v1'
@@ -55,6 +59,8 @@ interface StoredState {
   focusMinutesByDay: Record<string, number>
   /** Recent learning events (lessons, quizzes, focus sessions). */
   activity: ActivityEvent[]
+  /** Persisted adaptive study plan (daily target + scheduled tasks). */
+  studyPlan: StudyPlanState
 }
 interface AppContextValue extends StoredState {
   goals: Goal[]
@@ -118,6 +124,19 @@ interface AppContextValue extends StoredState {
   setAiRoadmapTopics: (topics: AiRoadmapTopic[]) => void
   /** Store a freshly generated AI roadmap for the current topic. */
   setAiRoadmap: (roadmap: AiGeneratedRoadmap | null) => void
+  /* ── Study plan (adaptive, persisted with the rest of the profile) ── */
+  /** Persisted plan: daily target + scheduled tasks. */
+  studyPlan: StudyPlanState
+  /** Replace the stored plan (used when applying a preview). */
+  setStudyPlan: (next: StudyPlanState) => void
+  /** Merge a patch into the stored plan. */
+  patchStudyPlan: (patch: Partial<StudyPlanState>) => void
+  /** Change the daily study target (persisted, re-plans the week). */
+  setDailyTargetMinutes: (minutes: number) => void
+  /** Apply a previewed plan (AI assistant or Replan My Week). */
+  applyStudyPlanPreview: (preview: StudyPlanPreview) => void
+  /** Discard a preview without touching the live plan. */
+  discardStudyPlanPreview: () => void
 }
 
 const AppContext = createContext<AppContextValue | null>(null)
@@ -199,6 +218,7 @@ function sanitizeStored(parsed: unknown): StoredState | null {
         )
       },
     ),
+    studyPlan: sanitizeStudyPlan(p.studyPlan, sanitizeUser(p.user).dailyGoalMinutes),
   }
 }
 
@@ -212,6 +232,76 @@ function sanitizeFocusMinutes(raw: unknown): Record<string, number> {
     }
   })
   return out
+}
+
+const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/
+const TASK_KINDS = ['lesson', 'quiz', 'review'] as const
+const TASK_PRIORITIES = ['high', 'medium', 'low'] as const
+
+/**
+ * Coerce a persisted study plan. Every field is validated because the record
+ * comes from localStorage and may be stale, hand-edited or from an older build:
+ * the Study Plan must degrade to an empty plan rather than crash the app.
+ */
+function sanitizeStudyPlan(raw: unknown, fallbackMinutes: number): StudyPlanState {
+  const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  // Accept a number OR a numeric string ("45" from an older build) so the
+  // selected target can never be compared against the numeric options with a
+  // mismatched type. Anything else falls back to the user's saved goal.
+  const rawMinutes = p.dailyTargetMinutes
+  const parsedMinutes =
+    typeof rawMinutes === 'number' && Number.isFinite(rawMinutes)
+      ? rawMinutes
+      : typeof rawMinutes === 'string' && rawMinutes.trim() !== '' && Number.isFinite(Number(rawMinutes))
+        ? Number(rawMinutes)
+        : NaN
+  const minutes = Number.isFinite(parsedMinutes) ? parsedMinutes : fallbackMinutes
+  const tasks: StudyTask[] = (Array.isArray(p.tasks) ? p.tasks : [])
+    .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+    .map((t): StudyTask => {
+      const kind = TASK_KINDS.includes(t.kind as (typeof TASK_KINDS)[number])
+        ? (t.kind as StudyTask['kind'])
+        : 'lesson'
+      const priority = TASK_PRIORITIES.includes(t.priority as (typeof TASK_PRIORITIES)[number])
+        ? (t.priority as StudyTask['priority'])
+        : 'medium'
+      return {
+        id: typeof t.id === 'string' && t.id ? t.id : `sp-${String(t.date ?? '')}-${kind}`,
+        kind,
+        ref: typeof t.ref === 'string' ? t.ref : '',
+        title: typeof t.title === 'string' && t.title ? t.title : 'Study task',
+        date: typeof t.date === 'string' && DAY_KEY.test(t.date) ? t.date : '',
+        estimatedMinutes:
+          typeof t.estimatedMinutes === 'number' && Number.isFinite(t.estimatedMinutes)
+            ? Math.max(1, Math.round(t.estimatedMinutes))
+            : 10,
+        actualMinutes:
+          typeof t.actualMinutes === 'number' && Number.isFinite(t.actualMinutes)
+            ? Math.max(0, Math.round(t.actualMinutes))
+            : 0,
+        priority,
+        status: t.status === 'done' || t.status === 'missed' ? t.status : 'planned',
+        source: t.source === 'ai' ? 'ai' : 'auto',
+        rescheduledFrom:
+          typeof t.rescheduledFrom === 'string' && DAY_KEY.test(t.rescheduledFrom)
+            ? t.rescheduledFrom
+            : undefined,
+        reason: typeof t.reason === 'string' ? t.reason : undefined,
+        completedAt: typeof t.completedAt === 'string' ? t.completedAt : undefined,
+      }
+    })
+    // A task with no valid date cannot be placed on the calendar.
+    .filter((t) => DAY_KEY.test(t.date))
+    // Collapse duplicate ids: corrupted plans carried a task into the same
+    // slot more than once. Keeping the first wins; legitimate sessions on
+    // different dates have different ids and are untouched.
+    .filter((t, i, arr) => arr.findIndex((x) => x.id === t.id) === i)
+  return {
+    dailyTargetMinutes: minutes,
+    tasks,
+    updatedAt: typeof p.updatedAt === 'string' ? p.updatedAt : null,
+    pendingPreview: null,
+  }
 }
 
 /** Local calendar day key (YYYY-MM-DD) used for the daily learning target. */
@@ -291,6 +381,10 @@ function freshStoredState(user: User): StoredState {
     aiRoadmap: base?.aiRoadmap ?? null,
     focusMinutesByDay: base?.focusMinutesByDay ?? {},
     activity: base?.activity ?? [],
+    studyPlan: sanitizeStudyPlan(
+      base?.studyPlan,
+      typeof from.dailyGoalMinutes === 'number' ? from.dailyGoalMinutes : 30,
+    ),
   }
 }
 
@@ -690,8 +784,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, aiRoadmapTopics: topics }))
   }, [])
 
-  const setAiRoadmap = useCallback((roadmap: AiGeneratedRoadmap | null) => {
-    if (!roadmap) {
+  const setAiRoadmap = useCallback((roadmap: AiGeneratedRoadmap | null) => {    if (!roadmap) {
       setState((s) => ({ ...s, aiRoadmap: null, aiRoadmapTopics: [] }))
       return
     }
@@ -721,6 +814,53 @@ export function AppProvider({ children }: { children: ReactNode }) {
       })
     })
     setState((s) => ({ ...s, aiRoadmap: roadmap, aiRoadmapTopics: flattened }))
+  }, [])
+
+  /* ── Study plan ────────────────────────────────────────────────────── */
+
+  const setStudyPlan = useCallback((next: StudyPlanState) => {
+    setState((s) => ({
+      ...s,
+      studyPlan: {
+        ...sanitizeStudyPlan(next, next.dailyTargetMinutes),
+        pendingPreview: null,
+      },
+    }))
+  }, [])
+
+  const patchStudyPlan = useCallback((patch: Partial<StudyPlanState>) => {
+    setState((s) => ({ ...s, studyPlan: reduceStudyPlan(s.studyPlan, { type: 'merge', patch }) }))
+  }, [])
+
+  /**
+   * The student's daily target is a real preference, so it is stored with the
+   * plan and mirrored onto the profile field the rest of the app already reads.
+   */
+  const setDailyTargetMinutes = useCallback((minutes: number) => {
+    setState((s) => {
+      const nextPlan = reduceStudyPlan(s.studyPlan, { type: 'set-daily-target', minutes })
+      return {
+        ...s,
+        user: { ...s.user, dailyGoalMinutes: nextPlan.dailyTargetMinutes },
+        studyPlan: nextPlan,
+      }
+    })
+  }, [])
+
+  const applyStudyPlanPreview = useCallback((preview: StudyPlanPreview) => {
+    setState((s) => ({
+      ...s,
+      studyPlan: {
+        ...s.studyPlan,
+        tasks: preview.tasks.map((task) => ({ ...task, status: 'planned' as const, actualMinutes: 0 })),
+        updatedAt: new Date().toISOString(),
+        pendingPreview: null,
+      },
+    }))
+  }, [])
+
+  const discardStudyPlanPreview = useCallback(() => {
+    setState((s) => ({ ...s, studyPlan: { ...s.studyPlan, pendingPreview: null } }))
   }, [])
 
   const value: AppContextValue = {
@@ -764,6 +904,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     updateAiTopic,
     setAiRoadmapTopics,
     setAiRoadmap,
+    studyPlan: state.studyPlan,
+    setStudyPlan,
+    patchStudyPlan,
+    setDailyTargetMinutes,
+    applyStudyPlanPreview,
+    discardStudyPlanPreview,
   }
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>

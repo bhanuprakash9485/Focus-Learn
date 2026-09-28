@@ -3,7 +3,15 @@ import type { QuizDifficulty, QuizQuestion, Roadmap } from '../types'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { AppLayout } from '../components/AppLayout'
 import { useApp } from '../context/AppContext'
-import { topicQuizLessonId } from '../services/goalProgress'
+import { goalQuizLessonId, topicQuizLessonId } from '../services/goalProgress'
+import {
+  catalogGoalToQuizInput,
+  getGoalQuizStatus,
+  getGoalQuizStatuses,
+  prepareGoalQuiz,
+  userGoalToQuizInput,
+  type GoalQuizGoalInput,
+} from '../services/goalQuiz'
 import {
   analyzeQuizPerformance,
   normalizeTopic,
@@ -21,10 +29,13 @@ import {
 } from '../services/topicQuiz'
 import type {
   AnswerFeedback,
+  GoalQuizStatus,
   Quiz,
+  QuizGenerationStage,
   TopicQuizStatus,
   TopicQuizSubmission,
 } from '../types'
+import { QUIZ_DIFFICULTY_LABEL as DIFFICULTY_LABEL } from '../types'
 import {
   IconArrowRight,
   IconCheck,
@@ -50,12 +61,18 @@ interface AnalysisState {
 interface AnsweredQuestion {
   selected: number
   correct: boolean
+  /** False while the save is still pending the server (kept on-device). */
+  synced?: boolean
 }
 
-const DIFFICULTY_LABEL: Record<QuizDifficulty, string> = {
-  basic: 'Basic',
-  moderate: 'Moderate',
-  advanced: 'Advanced',
+/** Which tier a reported generation stage belongs to, if any. */
+const GOAL_STAGE_TIER: Record<QuizGenerationStage, QuizDifficulty | undefined> = {
+  preparing: undefined,
+  basic_ready: 'basic',
+  moderate_ready: 'moderate',
+  difficult_ready: 'advanced',
+  complete: undefined,
+  failed: undefined,
 }
 
 function statusMessage(pct: number): string {
@@ -102,7 +119,9 @@ function makeRetestStatus(quiz: Quiz, quizId: string, topic: string): TopicQuizS
   return {
     quiz_id: quizId,
     topic,
-    lesson_id: quiz.lesson_id || quiz.lessonId,
+    // A retest is always topic scoped, so the topic's own lesson id is the
+    // right fallback when the payload has none.
+    lesson_id: quiz.lesson_id || quiz.lessonId || topicQuizLessonId(topic),
     state: 'ready',
     error: null,
     total: quiz.questions.length,
@@ -115,6 +134,71 @@ function makeRetestStatus(quiz: Quiz, quizId: string, topic: string): TopicQuizS
     difficulty_counts,
     answers: [],
     retest_ready: false,
+  }
+}
+
+/**
+ * Adapt the goal quiz status onto the runner's status shape.
+ *
+ * A goal's 10/10/10 quiz and a topic's 10/10/10 quiz are the same
+ * server-authoritative runner with the same tier gating, so the UI reads one
+ * shape. The only difference is identity: a goal quiz is tracked under its own
+ * goal lesson id so its score never collides with a single roadmap lesson.
+ */
+function goalStatusToRunner(status: GoalQuizStatus, goalId: string): TopicQuizStatus {
+  return {
+    quiz_id: status.quiz_id || '',
+    topic: status.topic || '',
+    lesson_id: status.lesson_id || goalQuizLessonId(goalId),
+    state: status.state,
+    error: status.error,
+    total: status.total,
+    question_count: status.question_count,
+    retest_of: null,
+    focus_concepts: [],
+    completed: status.completed,
+    attempts: status.attempts,
+    unlocked: status.unlocked,
+    difficulty_counts: status.difficulty_counts,
+    answers: status.answers,
+    retest_ready: status.retest_ready,
+    stage: status.stage,
+    expected_total: status.expected_total,
+    goal_id: status.goal_id,
+    tiers: status.tiers,
+  }
+}
+
+/**
+ * Poll a goal's quiz until its validated 30 questions are ready.
+ *
+ * The status endpoint is polled (not the quiz) because it carries the
+ * generation stage, so the student can see Basic/Moderate/Difficult land as
+ * they are written instead of staring at one spinner.
+ */
+async function awaitGoalQuiz(
+  goalId: string,
+  quizId: string,
+  onStage: (stage: QuizGenerationStage) => void,
+  timeoutMs = 420000,
+): Promise<{ quiz: Quiz; status: GoalQuizStatus }> {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    if (Date.now() > end) {
+      throw new TopicQuizError('Your quiz took too long to prepare. Please try again.', 0)
+    }
+    const status = await getGoalQuizStatus(goalId)
+    if (status.stage) onStage(status.stage)
+    if (status.state === 'failed') {
+      throw new TopicQuizError(
+        status.error || 'We could not prepare every question for this quiz yet. Please try again.',
+        422,
+      )
+    }
+    if (status.state === 'ready' && status.quiz_id) {
+      return { quiz: await getQuiz(status.quiz_id || quizId), status }
+    }
+    await sleep(2000)
   }
 }
 
@@ -143,10 +227,10 @@ function lessonTopicName(lessonId: string | undefined, roadmap: Roadmap | null):
 }
 
 export default function Quiz() {
-  const { lessonId, topic } = useParams()
+  const { lessonId, topic, goalId } = useParams()
   const navigate = useNavigate()
   const location = useLocation()
-  const { roadmap, recordAttempt, attempts } = useApp()
+  const { roadmap, recordAttempt, attempts, goals, userGoals } = useApp()
 
   // A topic quiz (from Focus Mode / AI roadmap / roadmap lesson "Take Quiz")
   // is server-driven with progressive difficulty unlocking. Lesson routes
@@ -154,6 +238,29 @@ export default function Quiz() {
   const resolvedLessonTopic = topic ? null : lessonTopicName(lessonId, roadmap)
   const topicName = topic ? normalizeTopic(topic) : resolvedLessonTopic ? normalizeTopic(resolvedLessonTopic) : null
   const isTopicQuiz = Boolean(topicName)
+
+  // A goal quiz (/quiz/goal/<goalId>) is the goal's own 10/10/10 assessment:
+  // one record per goal, independent of the goal's individual topic quizzes.
+  const isGoalQuiz = Boolean(goalId)
+  const savedGoal = useMemo(
+    () => (goalId ? userGoals.find((g) => g.id === goalId) || null : null),
+    [userGoals, goalId],
+  )
+  const catalogGoal = useMemo(
+    () => (goalId ? goals.find((g) => g.id === goalId) || null : null),
+    [goals, goalId],
+  )
+  const goalInput: GoalQuizGoalInput | null = useMemo(() => {
+    if (!goalId) return null
+    if (savedGoal) return userGoalToQuizInput(savedGoal)
+    if (catalogGoal) return catalogGoalToQuizInput(catalogGoal)
+    return null
+  }, [goalId, savedGoal, catalogGoal])
+  const goalTitle = savedGoal?.title || catalogGoal?.title || goalId || null
+  /** What the page is actually about — the topic, or the goal. */
+  const displayTitle = isGoalQuiz ? goalTitle : topicName
+  /** The label attempts/analysis are filed under. */
+  const attemptTopicName = isGoalQuiz ? goalTitle : topicName
 
   const [phase, setPhase] = useState<Phase>('intro')
   const [qIndex, setQIndex] = useState(0)
@@ -172,7 +279,82 @@ export default function Quiz() {
   const [submitting, setSubmitting] = useState(false)
   const [retesting, setRetesting] = useState(false)
   const [activeTier, setActiveTier] = useState<QuizDifficulty | null>(null)
+  const [goalStage, setGoalStage] = useState<QuizGenerationStage | null>(null)
+  const [goalStatuses, setGoalStatuses] = useState<Record<string, GoalQuizStatus>>({})
+  const [notice, setNotice] = useState<string | null>(null)
   const mountedRef = useRef(true)
+  const currentQuizIdRef = useRef<string | null>(null)
+  const syncQueueRef = useRef<{ index: number; selected: number; attempts: number }[]>([])
+  const syncRunningRef = useRef(false)
+
+  useEffect(() => {
+    currentQuizIdRef.current = quizId
+  }, [quizId])
+
+  /** Re-send answers that failed to save, without ever blocking the UI. */
+  function enqueueSync(index: number, selected: number) {
+    const existing = syncQueueRef.current.find((e) => e.index === index)
+    if (existing) {
+      existing.selected = selected
+      existing.attempts = 0
+    } else {
+      syncQueueRef.current.push({ index, selected, attempts: 0 })
+    }
+    setNotice(
+      'Your answer is saved on this device. We will keep trying to sync it to your progress.',
+    )
+    void drainSyncQueue()
+  }
+
+  async function drainSyncQueue() {
+    if (syncRunningRef.current) return
+    syncRunningRef.current = true
+    try {
+      while (syncQueueRef.current.length > 0 && mountedRef.current) {
+        const entry = syncQueueRef.current[0]
+        const targetQuizId = currentQuizIdRef.current
+        if (!targetQuizId) {
+          syncQueueRef.current.shift()
+          continue
+        }
+        await sleep(1500)
+        if (!mountedRef.current) return
+        try {
+          const fb: AnswerFeedback = await answerQuiz(targetQuizId, entry.index, entry.selected)
+          setAnswered((prev) => {
+            const current = prev[entry.index]
+            if (!current || current.synced !== false) return prev
+            return {
+              ...prev,
+              [entry.index]: { selected: fb.selected_index, correct: fb.is_correct, synced: true },
+            }
+          })
+          setServerStatus((prev) =>
+            prev
+              ? { ...prev, attempts: fb.attempts, unlocked: fb.unlocked, completed: fb.completed }
+              : prev,
+          )
+          setNotice(null)
+          syncQueueRef.current.shift()
+        } catch {
+          entry.attempts += 1
+          if (entry.attempts >= 5) {
+            syncQueueRef.current.shift()
+            setNotice(
+              'One answer could not be synced to your progress yet. Keep going — the rest are unaffected.',
+            )
+          }
+        }
+      }
+    } finally {
+      syncRunningRef.current = false
+    }
+  }
+
+  function clearSyncPending() {
+    syncQueueRef.current = []
+    setNotice(null)
+  }
 
   // Load / regenerate the AI topic quiz for the current topic. The backend
   // generates in the background; we poll the one quiz row until READY.
@@ -192,6 +374,7 @@ export default function Quiz() {
     setPhase('intro')
     setQIndex(0)
     setActiveTier(null)
+    clearSyncPending()
 
     const retestRequested = Boolean(location.state && (location.state as { retest?: boolean }).retest)
 
@@ -223,7 +406,7 @@ export default function Quiz() {
           setServerStatus(status)
           const restored: Record<number, AnsweredQuestion> = {}
           for (const a of status.answers) {
-            restored[a.index] = { selected: a.selected_index, correct: a.is_correct }
+            restored[a.index] = { selected: a.selected_index, correct: a.is_correct, synced: true }
           }
           setAnswered(restored)
           if (status.completed) {
@@ -269,6 +452,85 @@ export default function Quiz() {
     }
   }, [topicName])
 
+  // Load (or resume) the goal's own 10/10/10 quiz. The background run prepares
+  // one tier at a time, so we poll the goal status for its stage and adopt the
+  // stored quiz the moment it validates — a finished quiz always resumes
+  // exactly where the student left off, on any device.
+  useEffect(() => {
+    if (!goalId || !goalInput) return
+    mountedRef.current = true
+    setTopicStatus('preparing')
+    setTopicError('')
+    setTopicBlocked(false)
+    setServerStatus(null)
+    setTopicQuiz(null)
+    setQuizId(null)
+    setAnswered({})
+    setSelected([])
+    setResult(null)
+    setAnalysis({ status: 'idle' })
+    setPhase('intro')
+    setQIndex(0)
+    setActiveTier(null)
+    setGoalStage('preparing')
+    clearSyncPending()
+
+    ;(async () => {
+      try {
+        const prep = await prepareGoalQuiz(goalInput)
+        if (!mountedRef.current) return
+        const { quiz, status } = await awaitGoalQuiz(goalId, prep.quiz_id, (stage) => {
+          if (mountedRef.current) setGoalStage(stage)
+        })
+        if (!mountedRef.current) return
+        setQuizId(prep.quiz_id)
+        setTopicQuiz(quiz)
+        setSelected(Array(quiz.questions.length).fill(null))
+        setServerStatus(goalStatusToRunner(status, goalId))
+
+        const restored: Record<number, AnsweredQuestion> = {}
+        for (const a of status.answers) {
+          restored[a.index] = { selected: a.selected_index, correct: a.is_correct, synced: true }
+        }
+        setAnswered(restored)
+        if (status.completed) {
+          const sub = await submitQuiz(prep.quiz_id)
+          if (!mountedRef.current) return
+          setResult({ submission: sub })
+          setTopicStatus('result')
+          recordAttempt({
+            lessonId: status.lesson_id || goalQuizLessonId(goalId),
+            score: sub.score,
+            total: sub.total,
+            percentage: sub.percentage,
+            missedQuestionIds: quiz.questions
+              .filter((_, i) => restored[i] && restored[i].synced !== false && !restored[i].correct)
+              .map((q) => q.id),
+            difficultyBreakdown: sub.breakdown,
+            weakConcepts: sub.weak_concepts.length > 0 ? sub.weak_concepts : undefined,
+            topicName: goalTitle ?? undefined,
+          })
+          void runAnalysis(quiz, restored, sub.score)
+        } else {
+          setTopicStatus('intro')
+        }
+      } catch (err) {
+        if (!mountedRef.current) return
+        setTopicBlocked(Boolean(err instanceof TopicQuizError && err.blocked))
+        setTopicError(
+          err instanceof TopicQuizError
+            ? err.message
+            : 'Something went wrong. Please try again.',
+        )
+        setTopicStatus('error')
+      }
+    })()
+
+    return () => {
+      mountedRef.current = false
+    }
+  }, [goalId, goalInput, goalTitle])
+
   async function runAnalysis(
     quiz: import('../types').Quiz,
     answers: Record<number, AnsweredQuestion>,
@@ -289,7 +551,7 @@ export default function Quiz() {
       return a ? a.selected : -1
     })
     const res = await analyzeQuizPerformance({
-      roadmap_topic: quiz.topic || quiz.title,
+      roadmap_topic: quiz.topic || quiz.title || displayTitle || '',
       quiz_score: finalScore,
       total_questions: quiz.questions.length,
       questions: conceptQuestions,
@@ -313,24 +575,39 @@ export default function Quiz() {
     setResult(null)
     setAnalysis({ status: 'idle' })
     setActiveTier(null)
+    clearSyncPending()
   }
 
   async function submitAnswer(savedSelected: number) {
     if (!quizId || submitting) return
+    if (answered[qIndex] && answered[qIndex].synced !== false) return
     setSubmitting(true)
     try {
       const fb: AnswerFeedback = await answerQuiz(quizId, qIndex, savedSelected)
       setAnswered((prev) => ({
         ...prev,
-        [qIndex]: { selected: fb.selected_index, correct: fb.is_correct },
+        [qIndex]: { selected: fb.selected_index, correct: fb.is_correct, synced: true },
       }))
       setServerStatus((prev) =>
         prev
           ? { ...prev, attempts: fb.attempts, unlocked: fb.unlocked, completed: fb.completed }
           : prev,
       )
+      setNotice(null)
     } catch (err) {
-      setTopicError(err instanceof TopicQuizError ? err.message : 'Could not save your answer.')
+      // A failed or hanging save must never freeze the quiz: keep the answer
+      // on this device, show a visible inline note, and retry in the background
+      // while the student keeps moving through the questions.
+      setAnswered((prev) => ({
+        ...prev,
+        [qIndex]: { selected: savedSelected, correct: false, synced: false },
+      }))
+      setNotice(
+        err instanceof TopicQuizError && err.status === 0
+          ? 'The server is not reachable. Your answer is saved on this device and will sync when the connection is back.'
+          : 'Your answer could not be saved yet. It is kept on this device and we will keep retrying.',
+      )
+      enqueueSync(qIndex, savedSelected)
     } finally {
       setSubmitting(false)
     }
@@ -350,25 +627,30 @@ export default function Quiz() {
         total: sub.total,
         percentage: sub.percentage,
         missedQuestionIds: topicQuiz.questions
-          .filter((_, i) => liveAnswered[i] && !liveAnswered[i].correct)
+          .filter((_, i) => liveAnswered[i] && liveAnswered[i].synced !== false && !liveAnswered[i].correct)
           .map((q) => q.id),
         difficultyBreakdown: sub.breakdown,
         weakConcepts: sub.weak_concepts.length > 0 ? sub.weak_concepts : undefined,
-        topicName: topicName ?? undefined,
+        topicName: attemptTopicName ?? undefined,
       })
       void runAnalysis(topicQuiz, liveAnswered, sub.score)
     } catch (err) {
-      setTopicError(err instanceof TopicQuizError ? err.message : 'Could not submit your quiz.')
+      const msg = err instanceof TopicQuizError ? err.message : 'Could not submit your quiz.'
+      setNotice(`${msg} Your answers on this device are safe — press Finish again.`)
+      setTopicError(msg)
     } finally {
       setSubmitting(false)
     }
   }
 
   async function retest() {
-    if (!topicName || !topicQuiz || !result || !quizId) return
+    // Retests are a topic-quiz feature: a goal's own 10/10/10 record is its
+    // single authoritative assessment, so the results screen does not offer one.
+    if (!topicName || isGoalQuiz || !topicQuiz || !result || !quizId) return
     setRetesting(true)
     setTopicStatus('preparing')
     setTopicError('')
+    clearSyncPending()
     try {
       const weak = result.submission.weak_concepts
       const prep = await prepareQuiz({
@@ -400,10 +682,49 @@ export default function Quiz() {
   }
 
   function retryGenerate() {
+    // A failed goal run keeps the tiers that already validated, so retrying
+    // tops the quiz up instead of writing it again — and the answers the
+    // student already gave are restored from the server.
+    if (isGoalQuiz) {
+      if (!goalId || !goalInput) return
+      setTopicStatus('preparing')
+      setTopicError('')
+      setTopicBlocked(false)
+      setGoalStage('preparing')
+      clearSyncPending()
+      ;(async () => {
+        try {
+          const prep = await prepareGoalQuiz(goalInput)
+          const { quiz, status } = await awaitGoalQuiz(goalId, prep.quiz_id, (stage) => {
+            if (mountedRef.current) setGoalStage(stage)
+          })
+          if (!mountedRef.current) return
+          setQuizId(prep.quiz_id)
+          setTopicQuiz(quiz)
+          setServerStatus(goalStatusToRunner(status, goalId))
+          setSelected(Array(quiz.questions.length).fill(null))
+          const restored: Record<number, AnsweredQuestion> = {}
+          for (const a of status.answers) {
+            restored[a.index] = { selected: a.selected_index, correct: a.is_correct, synced: true }
+          }
+          setAnswered(restored)
+          setTopicStatus('intro')
+        } catch (err) {
+          if (!mountedRef.current) return
+          setTopicError(
+            err instanceof TopicQuizError ? err.message : 'Something went wrong. Please try again.',
+          )
+          setTopicBlocked(err instanceof TopicQuizError && err.blocked)
+          setTopicStatus('error')
+        }
+      })()
+      return
+    }
     if (!topicName) return
     setTopicStatus('preparing')
     setTopicError('')
     setTopicBlocked(false)
+    clearSyncPending()
     ;(async () => {
       try {
         const prep = await prepareQuiz({ topic: topicName, level: 'beginner' })
@@ -445,8 +766,60 @@ export default function Quiz() {
     return out
   }, [roadmap, attempts])
 
-  /* ── Loading / error while preparing a topic quiz ───────────────── */
-  if (isTopicQuiz && !topicQuiz) {
+  // The hub shows every goal the student can be quizzed on: their own goals
+  // first, then the rest of the catalog. One request covers all progress.
+  useEffect(() => {
+    if (topicName || goalId) return
+    let alive = true
+    ;(async () => {
+      try {
+        const statuses = await getGoalQuizStatuses()
+        if (alive) setGoalStatuses(statuses)
+      } catch {
+        // The hub still lists every goal without progress; opening one shows
+        // the real state, so a failure here is not worth an error screen.
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [topicName, goalId])
+
+  const goalCards = useMemo(() => {
+    const list: { id: string; title: string; subtitle: string }[] = []
+    const seen = new Set<string>()
+    for (const g of userGoals) {
+      if (seen.has(g.id)) continue
+      seen.add(g.id)
+      list.push({
+        id: g.id,
+        title: g.title,
+        subtitle: g.goalContext ? g.goalContext.slice(0, 90) : 'Your saved goal',
+      })
+    }
+    for (const g of goals) {
+      if (seen.has(g.id)) continue
+      seen.add(g.id)
+      list.push({ id: g.id, title: g.title, subtitle: g.category })
+    }
+    return list
+  }, [userGoals, goals])
+
+  /** "Not started" / "10 of 30 answered" / "Completed 80%". */
+  function goalProgressNote(status: GoalQuizStatus | undefined): string {
+    if (!status) return 'Not started'
+    if (status.state === 'failed') return 'Needs a retry'
+    if (status.completed) return 'Completed'
+    const answered = status.answers.length
+    if (answered === 0) {
+      if (status.state === 'generating') return 'Preparing…'
+      return 'Not started'
+    }
+    return `${answered} of ${status.total} answered`
+  }
+
+  /* ── Loading / error while preparing a quiz ─────────────────────── */
+  if ((isTopicQuiz || isGoalQuiz) && !topicQuiz) {
     if (topicStatus === 'error') {
       return (
         <AppLayout>
@@ -454,7 +827,7 @@ export default function Quiz() {
             <div className="card text-center" style={{ padding: '2.2rem 1.5rem' }}>
               <span className="badge badge-muted" style={{ marginBottom: '0.8rem' }}>
                 <IconQuiz size={13} />
-                {topicName}
+                {displayTitle}
               </span>
               <h1 style={{ fontSize: '1.35rem' }}>Quiz unavailable</h1>
               <p className="muted mt-1">{topicError}</p>
@@ -463,9 +836,15 @@ export default function Quiz() {
                   Try Again
                   <IconArrowRight size={16} />
                 </button>
-                <Link to="/search" className="btn btn-ghost">
-                  Back to search
-                </Link>
+                {isGoalQuiz ? (
+                  <Link to="/quiz" className="btn btn-ghost">
+                    All quizzes
+                  </Link>
+                ) : (
+                  <Link to="/search" className="btn btn-ghost">
+                    Back to search
+                  </Link>
+                )}
               </div>
               {topicBlocked && (
                 <p className="faint small mt-2">
@@ -477,6 +856,8 @@ export default function Quiz() {
         </AppLayout>
       )
     }
+    const stageTier = isGoalQuiz && goalStage ? GOAL_STAGE_TIER[goalStage] : undefined
+    const stageNote = stageTier ? ` ${DIFFICULTY_LABEL[stageTier]} is ready and saved.` : ''
     return (
       <AppLayout>
         <div className="page page-narrow">
@@ -486,21 +867,80 @@ export default function Quiz() {
               {retesting ? 'Preparing your retest…' : 'Preparing your quiz…'}
             </h2>
             <p className="muted mt-1">
-              Writing 30 questions on "{topicName}" across basic, moderate and advanced.
+              Writing 30 questions{isGoalQuiz ? '' : ` on "${topicName}"`} across basic,
+              moderate and difficult.{stageNote}
             </p>
+            {isGoalQuiz && (
+              <p className="faint small mt-1">
+                Each tier is saved as soon as it is written — you can leave and come back.
+              </p>
+            )}
           </div>
         </div>
       </AppLayout>
     )
   }
 
-  if (!topicQuiz && !lessonId) {
+  if (isGoalQuiz && !goalInput) {
+    return (
+      <AppLayout>
+        <div className="page page-narrow">
+          <div className="card text-center" style={{ padding: '3rem 1.5rem' }}>
+            <h1 style={{ fontSize: '1.35rem' }}>Goal not found</h1>
+            <p className="muted mt-1">This goal is not in the catalog or your saved goals.</p>
+            <Link to="/goals" className="btn btn-primary mt-2">Back to Goals</Link>
+          </div>
+        </div>
+      </AppLayout>
+    )
+  }
+
+  if (!topicQuiz && !lessonId && !isGoalQuiz) {
     return (
       <AppLayout>
         <div className="page">
           <div className="page-header">
-            <h1>Topic Quizzes</h1>
-            <p>30-question assessments after each lesson — basic, moderate and advanced.</p>
+            <h1>Goal Quizzes</h1>
+            <p>
+              Every goal has its own 30-question assessment — 10 basic, 10 moderate and 10
+              difficult, each tier saved as you pass it.
+            </p>
+          </div>
+          <div className="grid-auto">
+            {goalCards.map((g) => {
+              const status = goalStatuses[g.id]
+              const done = Boolean(status?.completed)
+              return (
+                <div
+                  key={g.id}
+                  className="card card-hover"
+                  onClick={() => navigate(`/quiz/goal/${encodeURIComponent(g.id)}`)}
+                >
+                  <div className="row-between mb-1">
+                    <span className="badge badge-primary">Goal quiz</span>
+                    {done ? <span className="badge badge-success">Completed</span> : null}
+                  </div>
+                  <h3 className="card-title">{g.title}</h3>
+                  <p className="card-desc">30 questions · Basic · Moderate · Difficult</p>
+                  {g.subtitle && <p className="faint small mt-1">{g.subtitle}</p>}
+                  <div className="row-between mt-2">
+                    <span className="row small muted">
+                      <IconQuiz size={15} />
+                      {goalProgressNote(status)}
+                    </span>
+                    <span className="row small" style={{ color: 'var(--primary)', fontWeight: 600 }}>
+                      {done ? 'Review' : status ? 'Resume' : 'Start'}
+                      <IconArrowRight size={15} />
+                    </span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
+          <div className="page-header mt-3">
+            <h2>Lesson Quizzes</h2>
+            <p>30-question assessments after each lesson — basic, moderate and difficult.</p>
           </div>
           {availableQuizzes.length > 0 ? (
             <div className="grid-auto">
@@ -515,7 +955,7 @@ export default function Quiz() {
                     {q.done && <span className="badge badge-success">Attempted</span>}
                   </div>
                   <h3 className="card-title">{q.title}</h3>
-                  <p className="card-desc">30 questions · Basic · Moderate · Advanced</p>
+                  <p className="card-desc">30 questions · Basic · Moderate · Difficult</p>
                   <div className="row-between mt-2">
                     <span className="row small muted">
                       <IconQuiz size={15} />
@@ -640,9 +1080,10 @@ export default function Quiz() {
     const statusTone = pct >= 80 ? 'pass' : pct >= 60 ? 'practice' : 'review'
     const review = questions.map((q, i) => {
       const a = answered[i]
-      const wasAnswered = Boolean(a)
-      const correct = Boolean(a && a.correct)
-      return { q, i, wasAnswered, correct }
+      const unsynced = Boolean(a && a.synced === false)
+      const wasAnswered = Boolean(a && a.synced !== false)
+      const correct = Boolean(a && a.synced !== false && a.correct)
+      return { q, i, wasAnswered, correct, unsynced }
     })
     const incorrectCount = review.filter((r) => r.wasAnswered && !r.correct).length
     const skippedCount = review.filter((r) => !r.wasAnswered).length
@@ -729,7 +1170,7 @@ export default function Quiz() {
                       navigate('/ai-roadmap', {
                         state: {
                           analysis: analysis.analysis,
-                          topicName,
+                          topicName: displayTitle,
                           quizScore: result.submission.score,
                           quizTotal: result.submission.total,
                         },
@@ -753,17 +1194,29 @@ export default function Quiz() {
                     <span key={c} className="quiz-chip">{c}</span>
                   ))}
                 </div>
-                <button className="btn btn-primary mt-2" onClick={retest} disabled={retesting}>
-                  {retesting ? 'Preparing retest…' : 'Retest Weak Concepts'}
-                  {!retesting && <IconArrowRight size={16} />}
-                </button>
+                {isGoalQuiz ? (
+                  <p className="faint small mt-1">
+                    These are carried into your AI study plan and adaptive roadmap.
+                  </p>
+                ) : (
+                  <button className="btn btn-primary mt-2" onClick={retest} disabled={retesting}>
+                    {retesting ? 'Preparing retest…' : 'Retest Weak Concepts'}
+                    {!retesting && <IconArrowRight size={16} />}
+                  </button>
+                )}
               </div>
             )}
 
             <div className="row wrap" style={{ justifyContent: 'center', marginTop: '1.2rem' }}>
-              <button className="btn btn-secondary" onClick={resetRun}>
-                Retake
-              </button>
+              {isGoalQuiz ? (
+                <Link to="/quiz" className="btn btn-secondary">
+                  All goal quizzes
+                </Link>
+              ) : (
+                <button className="btn btn-secondary" onClick={resetRun}>
+                  Retake
+                </button>
+              )}
               <Link to="/performance" className="btn btn-primary">
                 <IconTrend size={16} />
                 View Performance
@@ -779,7 +1232,7 @@ export default function Quiz() {
               <IconSparkles size={18} />
               <h2 style={{ fontSize: '1.05rem' }}>Review every question</h2>
             </div>
-            {review.map(({ q, i, wasAnswered, correct }) => (
+            {review.map(({ q, i, wasAnswered, correct, unsynced }) => (
               <div key={q.id} className="quiz-review-item">
                 <div className="row-between wrap" style={{ gap: '0.4rem' }}>
                   <div className="row" style={{ gap: '0.5rem', alignItems: 'center' }}>
@@ -789,18 +1242,23 @@ export default function Quiz() {
                   </div>
                   <div className="row" style={{ gap: '0.4rem' }}>
                     {q.difficulty && (
-                      <span className={`quiz-difficulty-badge ${q.difficulty}`}>{q.difficulty}</span>
+                      <span className={`quiz-difficulty-badge ${q.difficulty}`}>
+                        {DIFFICULTY_LABEL[q.difficulty]}
+                      </span>
                     )}
-                    <span className={`quiz-count-pill ${correct ? 'success' : wasAnswered ? 'danger' : 'muted'}`}>
-                      {correct ? <IconCheck size={12} /> : <IconX size={12} />}
-                      {correct ? 'Correct' : wasAnswered ? 'Incorrect' : 'Skipped'}
+                    <span
+                      className={`quiz-count-pill ${unsynced ? 'muted' : correct ? 'success' : wasAnswered ? 'danger' : 'muted'}`}
+                    >
+                      {unsynced ? <IconSparkles size={12} /> : correct ? <IconCheck size={12} /> : <IconX size={12} />}
+                      {unsynced ? 'Syncing' : correct ? 'Correct' : wasAnswered ? 'Incorrect' : 'Skipped'}
                     </span>
                   </div>
                 </div>
                 <div className="quiz-review-answer">
                   <span className="faint small">
                     Your answer:{' '}
-                    {wasAnswered ? q.options[answered[i].selected] ?? '—' : 'Not answered'}
+                    {wasAnswered || unsynced ? q.options[answered[i].selected] ?? '—' : 'Not answered'}
+                    {unsynced ? ' (not synced to your progress yet — will keep retrying)' : ''}
                   </span>
                   <span className="small" style={{ color: 'var(--success)', fontWeight: 600 }}>
                     Correct: {q.options[q.correctIndex]}
@@ -825,9 +1283,9 @@ export default function Quiz() {
           <div className="card text-center" style={{ padding: '2.2rem 1.5rem' }}>
             <span className="badge badge-primary" style={{ marginBottom: '0.8rem' }}>
               <IconQuiz size={13} />
-              Topic quiz · 30 questions
+              {isGoalQuiz ? `Goal quiz · ${total} questions` : `Topic quiz · ${total} questions`}
             </span>
-            <h1 style={{ fontSize: '1.5rem' }}>{topicName}</h1>
+            <h1 style={{ fontSize: '1.5rem' }}>{displayTitle}</h1>
             <p className="muted mt-1">{total} Questions</p>
             {answeredHere > 0 && (
               <p className="faint small mt-1">
@@ -900,7 +1358,7 @@ export default function Quiz() {
             </div>
             <p className="faint small mt-2">
               Answer any 3 Basic questions to unlock Moderate, then any 3 Moderate to unlock
-              Advanced. Correct and incorrect answers both count.
+              Difficult. Correct and incorrect answers both count.
             </p>
             {answeredHere > 0 && (
               <div className="mt-2">
@@ -993,6 +1451,13 @@ export default function Quiz() {
               <div className="quiz-progress-fill" style={{ width: `${progress}%` }} />
             </div>
 
+            {notice && (
+              <div className="banner banner-warning mt-2" role="status">
+                <IconSparkles size={17} />
+                <span>{notice}</span>
+              </div>
+            )}
+
             <div className="quiz-tier-nav">
               {QUIZ_TIER_ORDER.map((d) => {
                 const isCurrent = d === active
@@ -1069,7 +1534,15 @@ export default function Quiz() {
                     })}
                   </div>
 
-                  {answeredNow && (
+                  {answeredNow && answeredNow.synced === false && (
+                    <div className="banner banner-warning mt-1" style={{ opacity: 0.85 }}>
+                      <IconSparkles size={17} />
+                      <span>
+                        Answer kept on this device — syncing to your progress, you can keep going.
+                      </span>
+                    </div>
+                  )}
+                  {answeredNow && answeredNow.synced !== false && (
                     <div
                       className={`banner ${answeredNow.correct ? 'banner-success' : 'banner-warning'} mt-1`}
                     >
@@ -1152,7 +1625,7 @@ export default function Quiz() {
                 </li>
                 <li>
                   <IconSparkles size={14} />
-                  <span>Answer 3 Basic to unlock Moderate, 3 Moderate to unlock Advanced</span>
+                  <span>Answer 3 Basic to unlock Moderate, 3 Moderate to unlock Difficult</span>
                 </li>
                 <li>
                   <IconTrend size={14} />

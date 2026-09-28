@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "test": "node scripts/run-tests.mjs",
     "backend": "python backend/server.py"
   },
   "dependencies": {

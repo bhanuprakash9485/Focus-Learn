@@ -28,8 +28,13 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+# FOCUSLEARN_DATA_DIR lets a deployment (or a test) put the SQLite file
+# somewhere writable and isolated - Vercel needs /tmp, tests need a temp dir.
+# Unset, it keeps the historical backend/data/focuslearn.db location.
+_DATA_DIR = (os.environ.get("FOCUSLEARN_DATA_DIR") or "").strip()
 DB_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "focuslearn.db"
+    _DATA_DIR if _DATA_DIR else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+    "focuslearn.db",
 )
 SESSION_TTL_DAYS = 30
 PBKDF2_ITERATIONS = 100_000

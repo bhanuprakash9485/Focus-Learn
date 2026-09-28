@@ -36,8 +36,14 @@ function fallbackMessage(status: number): string {
       return 'Please check the quiz details and try again.'
     case 401:
       return 'Your session has expired. Please log in again.'
+    case 403:
+      return 'That difficulty tier is still locked.'
     case 409:
       return 'This quiz is still being prepared. Please wait a moment.'
+    case 422:
+      return 'Quiz preparation failed. Please try again shortly.'
+    case 429:
+      return 'The AI service is busy right now. Please try again shortly.'
     case 503:
       return 'Quiz preparation is temporarily unavailable. Please try again.'
     default:
@@ -51,7 +57,10 @@ function meaningfulError(error: string | undefined, status: number): string {
   return fallbackMessage(status)
 }
 
-async function topicQuizFetch<T>(path: string, method: string, body?: unknown): Promise<T> {
+export async function quizFetch<T>(path: string, method: string, body?: unknown, timeoutMs?: number): Promise<T> {
+  const timeout = timeoutMs ?? 20_000
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeout)
   let res: Response
   let data: { error?: string } | null = null
   try {
@@ -60,9 +69,15 @@ async function topicQuizFetch<T>(path: string, method: string, body?: unknown): 
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
     })
-  } catch {
+  } catch (err) {
+    if ((err as Error)?.name === 'AbortError') {
+      throw new TopicQuizError('This request took too long and was cancelled. Please try again.', 0)
+    }
     throw new TopicQuizError('Could not reach the server. Check your connection and try again.', 0)
+  } finally {
+    window.clearTimeout(timer)
   }
   try {
     data = (await res.json()) as { error?: string } | null
@@ -108,7 +123,7 @@ function emptyBreakdown(): DifficultyBreakdown {
 export async function prepareQuiz(input: PrepareQuizInput): Promise<PrepareResult> {
   const topic = (input.topic || '').trim().slice(0, 200)
   if (!topic) throw new TopicQuizError('Enter a topic to prepare a quiz.', 400)
-  return topicQuizFetch<PrepareResult>('/api/quiz/prepare', 'POST', {
+  return quizFetch<PrepareResult>('/api/quiz/prepare', 'POST', {
     topic,
     level: (input.level || 'beginner').slice(0, 20),
     goal: input.goal,
@@ -125,7 +140,7 @@ export async function prepareQuiz(input: PrepareQuizInput): Promise<PrepareResul
 export async function getQuizStatus(topic: string): Promise<TopicQuizStatus> {
   const t = (topic || '').trim().slice(0, 200)
   if (!t) throw new TopicQuizError('Enter a topic to check quiz status.', 400)
-  return topicQuizFetch<TopicQuizStatus>(
+  return quizFetch<TopicQuizStatus>(
     `/api/quiz/status?topic=${encodeURIComponent(t)}`,
     'GET',
   )
@@ -134,7 +149,7 @@ export async function getQuizStatus(topic: string): Promise<TopicQuizStatus> {
 /** The validated quiz (only available once READY). */
 export async function getQuiz(quizId: string): Promise<Quiz> {
   if (!quizId) throw new TopicQuizError('Quiz not found.', 404)
-  const data = await topicQuizFetch<{ quiz: Quiz }>(
+  const data = await quizFetch<{ quiz: Quiz }>(
     `/api/quiz/${encodeURIComponent(quizId)}`,
     'GET',
   )
@@ -148,7 +163,7 @@ export async function answerQuiz(
   selectedIndex: number,
 ): Promise<AnswerFeedback> {
   if (!quizId) throw new TopicQuizError('Quiz not found.', 404)
-  return topicQuizFetch<AnswerFeedback>(
+  return quizFetch<AnswerFeedback>(
     `/api/quiz/${encodeURIComponent(quizId)}/answer`,
     'POST',
     { index, selected_index: selectedIndex },
@@ -158,7 +173,7 @@ export async function answerQuiz(
 /** Submit — the server scores authoritatively and returns the breakdown. */
 export async function submitQuiz(quizId: string): Promise<TopicQuizSubmission> {
   if (!quizId) throw new TopicQuizError('Quiz not found.', 404)
-  const data = await topicQuizFetch<{ submission: TopicQuizSubmission }>(
+  const data = await quizFetch<{ submission: TopicQuizSubmission }>(
     `/api/quiz/${encodeURIComponent(quizId)}/submit`,
     'POST',
   )

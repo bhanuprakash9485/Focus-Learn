@@ -194,12 +194,14 @@ function GoalCard({
   onContinue,
   onViewRoadmap,
   onManage,
+  onTakeQuiz,
 }: {
   goal: UserGoal
   progress: GoalProgress | null
   onContinue: () => void
   onViewRoadmap: () => void
   onManage: () => void
+  onTakeQuiz: () => void
 }) {
   const StatusIcon = GOAL_TYPE_ICON[goal.goalType] ?? IconTarget
   const percent = progress?.percent ?? 0
@@ -302,6 +304,11 @@ function GoalCard({
         >
           Continue Learning
           <IconArrowRight size={15} />
+        </button>
+        {/* The goal's own 10/10/10 quiz is independent of the roadmap, so it
+            stays available even while a roadmap is still generating. */}
+        <button className="btn btn-ghost" onClick={onTakeQuiz}>
+          Take Goal Quiz
         </button>
         <button className="btn btn-ghost" onClick={onViewRoadmap} disabled={!goal.roadmap}>
           View Roadmap
@@ -1222,6 +1229,11 @@ export default function Goals() {
     navigate(`/quiz/topic/${encodeURIComponent(topic)}`)
   }
 
+  /** The goal's own 30-question assessment (10 basic / 10 moderate / 10 difficult). */
+  function handleTakeAssessment(goal: UserGoal) {
+    navigate(`/quiz/goal/${encodeURIComponent(goal.id)}`)
+  }
+
   async function handleAction(goal: UserGoal, action: GoalAction, message: string) {
     try {
       await runGoalAction(goal.id, action)
@@ -1487,6 +1499,7 @@ export default function Goals() {
                         onContinue={() => handleContinue(goal)}
                         onViewRoadmap={() => setViewGoal(goal)}
                         onManage={() => setManageGoal(goal)}
+                        onTakeQuiz={() => handleTakeAssessment(goal)}
                       />
                     ))}
                   </div>
@@ -1696,6 +1709,15 @@ export default function Goals() {
                       <span className="badge badge-primary">{goal.difficulty}</span>
                     </div>
                     <div className="goal-card-actions">
+                      <button
+                        className="btn btn-ghost"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          navigate(`/quiz/goal/${encodeURIComponent(goal.id)}`)
+                        }}
+                      >
+                        Take Quiz
+                      </button>
                       <span className="row dash-reco-go" style={{ alignSelf: 'center' }}>
                         {hasRoadmap ? 'Start' : 'Build with AI'}
                         <IconArrowRight size={15} />

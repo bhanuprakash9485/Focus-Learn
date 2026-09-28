@@ -69,11 +69,13 @@ from groq_service import (
     recommend_next_topic,
     create_roadmap,
     generate_topic_quiz,
+    build_study_plan,
     groq_available,
     generate_learning_guide,
     GroqConfigurationError,
     QuizRateLimitError,
     RATE_LIMIT_MESSAGE,
+    STUDY_PLAN_RATE_LIMIT_MESSAGE,
 )
 
 # Bind 0.0.0.0 so the API is reachable from the deployed frontend, the
@@ -119,6 +121,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json_response(self, status: int, data: dict, set_cookie=None, clear_cookie=False) -> None:
         body = json.dumps(data).encode("utf-8")
+        self._drain_request_body()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -129,18 +132,31 @@ class Handler(BaseHTTPRequestHandler):
         if clear_cookie:
             auth.clear_session_cookie(self)
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
+
+    def _write_body(self, body: bytes) -> None:
+        """Send the response body, tolerating a client that already hung up.
+
+        A browser closing a tab or a client aborting mid-request is ordinary
+        traffic, not a server fault: without this the thread prints a
+        connection traceback for a response nobody is waiting for.
+        """
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+            self.close_connection = True
 
     def _json_response_no_cookie(self, status: int, data: dict) -> None:
         """JSON response that never sets/clears cookies."""
         body = json.dumps(data).encode("utf-8")
+        self._drain_request_body()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", self._cors_origin())
         self.send_header("Access-Control-Allow-Credentials", "true")
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _serve_static_file(self, fullpath: str) -> None:
         try:
@@ -204,6 +220,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/quiz/prepare":
             return self._handle_quiz_prepare()
+        if path.startswith("/api/quiz/goal/"):
+            # /api/quiz/goal/<goalId>/prepare
+            parts = path.split("/")
+            if len(parts) == 6 and parts[3] == "goal" and parts[4]:
+                if parts[5] == "prepare":
+                    return self._handle_quiz_goal_prepare(parts[4])
+                return self._json_response(404, {"error": "Not found"})
+            return self._json_response(404, {"error": "Not found"})
         if path.startswith("/api/quiz/"):
             parts = path.split("/")
             # /api/quiz/<id>/answer | /api/quiz/<id>/submit
@@ -217,6 +241,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/roadmaps/refresh":
             return self._handle_roadmaps_refresh()
+
+        if path == "/api/study-plan/plan":
+            return self._handle_study_plan()
 
         if path == "/api/goals":
             return self._handle_goals_create()
@@ -268,10 +295,40 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Authentication ──────────────────────────────────────────────
 
+    def _drain_request_body(self) -> None:
+        """Consume any request body that a handler chose not to read.
+
+        A handler that answers early (401/403/404/422) leaves the client's
+        payload in the socket buffer. Writing the response and closing then
+        resets the connection, which the client sees as a network error instead
+        of the status we just sent. Draining first keeps every early error a
+        clean, readable response.
+
+        A body that a handler already consumed is never read again - the socket
+        has nothing left to give and a second read would block.
+        """
+        if getattr(self, "_body_consumed", False):
+            return
+        if self.command not in ("POST", "PUT", "PATCH"):
+            return
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if remaining <= 0:
+            return
+        self._body_consumed = True
+        try:
+            self.rfile.read(remaining)
+        except OSError:
+            pass
+
     def _read_json_body(self) -> dict:
         """Read + decode a JSON body. Returns {} on any problem."""
+        self._body_consumed = True
         try:
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._body_consumed = True
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             return {}
@@ -550,6 +607,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._body_consumed = True
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             return self._json_response(400, {"error": "Invalid JSON body"})
@@ -610,6 +668,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._body_consumed = True
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             return self._json_response(400, {"error": "Invalid JSON body"})
@@ -678,6 +737,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._body_consumed = True
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             return self._json_response(400, {"error": "Invalid JSON body"})
@@ -732,6 +792,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._body_consumed = True
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             return self._json_response(400, {"error": "Invalid JSON body"})
@@ -787,6 +848,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self._body_consumed = True
             payload = json.loads(raw.decode("utf-8")) if raw else {}
         except ValueError:
             return self._json_response(400, {"error": "Invalid JSON body"})
@@ -921,6 +983,78 @@ class Handler(BaseHTTPRequestHandler):
         )
         return self._json_response(200, {"quiz": quiz})
 
+    def _goal_for_quiz(self, goal_id: str, user_id: str) -> dict | None:
+        """The goal a goal-quiz is built from.
+
+        A user's own (or custom) goal comes from the database. A goal that only
+        exists in the public catalogue is built from the definition the client
+        sends, so every selectable goal can have a quiz.
+        """
+        goal_id = str(goal_id or "").strip()[:80]
+        if not goal_id:
+            return None
+        goal = goals.get_goal(user_id, goal_id)
+        if goal:
+            return goal
+        payload = self._read_json_body() or {}
+        title = str(payload.get("title") or "").strip()[:200]
+        if not title:
+            return None
+        return {
+            "id": goal_id,
+            "title": title,
+            "description": str(payload.get("description") or "")[:2000],
+            "goalContext": str(payload.get("goalContext") or "")[:2000],
+            "existingKnowledge": str(payload.get("existingKnowledge") or "")[:1000],
+            "experienceLevel": str(payload.get("experienceLevel") or "beginner")[:20],
+            "roadmap": payload.get("roadmap") if isinstance(payload.get("roadmap"), dict) else None,
+        }
+
+    def _handle_quiz_goal_prepare(self, goal_id: str) -> None:
+        """POST /api/quiz/goal/:goalId/prepare — background 10/10/10 goal quiz.
+
+        Returns immediately. Idempotent: a complete, validated quiz for this goal
+        is returned as-is and Groq is never called again for it.
+        """
+        user = self._require_user()
+        if not user:
+            return self._json_response(401, {"error": "Authentication required."})
+        goal = self._goal_for_quiz(goal_id, user["id"])
+        if not goal:
+            return self._json_response(400, {"error": "Missing required field: title"})
+        guard_reason = safesearch.unsafe_reason(str(goal.get("title") or ""))
+        if guard_reason:
+            self.log_message("SafeSearch blocked goal quiz prep for %r (%s)", goal_id, guard_reason)
+            return self._json_response(422, {"error": "This content isn't available on FocusLearn."})
+        try:
+            result = quiz_service.prepare_goal_quiz(user["id"], goal)
+        except ValueError as exc:
+            return self._json_response(400, {"error": str(exc)})
+        self.log_message(
+            "  Goal quiz prep for %r (user=%s): %s %s",
+            goal.get("title"),
+            user["id"],
+            result["status"],
+            result.get("quiz_id", ""),
+        )
+        return self._json_response(200, {**result, "goal_id": goal["id"]})
+
+    def _handle_quiz_goal_status(self, goal_id: str) -> None:
+        """GET /api/quiz/goal/:goalId — authoritative state of the goal quiz."""
+        user = self._require_user()
+        if not user:
+            return self._json_response(401, {"error": "Authentication required."})
+        return self._json_response(
+            200, quiz_service.get_goal_status(user["id"], str(goal_id)[:80])
+        )
+
+    def _handle_quiz_goal_statuses(self) -> None:
+        """GET /api/quiz/goals — every stored goal quiz in one response."""
+        user = self._require_user()
+        if not user:
+            return self._json_response(401, {"error": "Authentication required."})
+        return self._json_response(200, {"goals": quiz_service.get_goal_statuses(user["id"])})
+
     def _handle_quiz_prepare(self) -> None:
         """POST /api/quiz/prepare — start background quiz generation.
 
@@ -962,6 +1096,10 @@ class Handler(BaseHTTPRequestHandler):
                 roadmap_id=roadmap_id,
                 focus_concepts=concepts,
                 retest_of=retest_of,
+                # This endpoint is always the topic quiz. ``goal`` only tells
+                # the generator which goal a topic belongs to; a goal's own
+                # 10/10/10 quiz has its own endpoint and scope.
+                scope="topic",
             )
         except ValueError as exc:
             return self._json_response(400, {"error": str(exc)})
@@ -1029,6 +1167,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         except IndexError:
             return self._json_response(400, {"error": "Question or answer index out of range."})
+        except quiz_service.QuizLockedError as exc:
+            return self._json_response(403, {"error": str(exc)})
         if result is None:
             status = quiz_service.get_status(user["id"], quiz_id)
             if status and status["state"] == "generating":
@@ -1061,6 +1201,123 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_roadmaps_refresh(self) -> None:
         """POST /api/roadmaps/refresh — force a fresh catalog sync."""
         return self._json_response(200, roadmap_catalog.get_catalog(force_refresh=True))
+
+    # ── Study plan (authenticated, per-user) ─────────────────────
+
+    def _handle_study_plan(self) -> None:
+        """POST /api/study-plan/plan — AI assist for the adaptive Study Plan.
+
+        Body: {"mode": "today" | "week", "goal", "dailyTargetMinutes",
+               "candidates": [...], "quizAttempts": [...], "weakTopics": [...],
+               "completedLessonIds": [...], "missedCount", "targetDate"}
+
+        The candidate list is built by the client from the student's REAL
+        roadmap/quizzes, so the AI can only *order* work that genuinely exists.
+        Every returned ref is validated against that list server-side, and the
+        response is a PREVIEW: the client decides whether to apply it.
+
+        Returns: {"ok": true, "summary", "tasks": [...], "ai": true}
+        """
+        user = self._require_user()
+        if user is None:
+            return
+
+        payload = self._read_json_body()
+        if not isinstance(payload, dict):
+            payload = {}
+
+        mode = str(payload.get("mode") or "today").strip().lower()
+        if mode not in ("today", "week"):
+            return self._json_response(400, {"ok": False, "error": "Invalid mode."})
+
+        goal = str(payload.get("goal") or "").strip()[:200]
+        guard_reason = safesearch.unsafe_reason(goal) if goal else None
+        if guard_reason:
+            self.log_message("SafeSearch blocked study planning (%s)", guard_reason)
+            return self._json_response(
+                422, {"ok": False, "error": "This content isn't available on FocusLearn."}
+            )
+
+        # Whitelist the client's candidate fields — no pass-through blobs.
+        candidates: list[dict] = []
+        for raw in (payload.get("candidates") or [])[:60]:
+            if not isinstance(raw, dict):
+                continue
+            ref = str(raw.get("ref") or "").strip()[:120]
+            if not ref:
+                continue
+            try:
+                minutes = int(raw.get("minutes") or 0)
+            except (TypeError, ValueError):
+                minutes = 0
+            candidates.append(
+                {
+                    "ref": ref,
+                    "kind": str(raw.get("kind") or "lesson"),
+                    "title": str(raw.get("title") or ref)[:120],
+                    "minutes": max(5, min(minutes, 240)),
+                    "step": raw.get("step"),
+                    "prerequisites": [str(p)[:80] for p in (raw.get("prerequisites") or [])][:6],
+                }
+            )
+        if not candidates:
+            return self._json_response(
+                400, {"ok": False, "error": "There is nothing left to plan yet."}
+            )
+
+        try:
+            daily_target = int(payload.get("dailyTargetMinutes") or 30)
+        except (TypeError, ValueError):
+            daily_target = 30
+
+        context = {
+            "mode": mode,
+            "goal": goal,
+            "today": str(payload.get("today") or "")[:20],
+            "daily_target_minutes": max(10, min(daily_target, 240)),
+            "target_date": str(payload.get("targetDate") or "")[:20],
+            "missed_count": int(payload.get("missedCount") or 0),
+            "candidates": candidates,
+            "quiz_attempts": [
+                {
+                    "topic": str(a.get("topic") or "")[:80],
+                    "percentage": a.get("percentage") or 0,
+                }
+                for a in (payload.get("quizAttempts") or [])[:20]
+                if isinstance(a, dict)
+            ],
+            "weak_topics": [str(t)[:80] for t in (payload.get("weakTopics") or [])[:20]],
+            "completed_lesson_ids": [
+                str(t)[:80] for t in (payload.get("completedLessonIds") or [])[:80]
+            ],
+        }
+
+        self.log_message(
+            "  [study-plan] %s plan for %s (%d candidates)",
+            mode,
+            user["email"],
+            len(candidates),
+        )
+        try:
+            plan = build_study_plan(context)
+        except QuizRateLimitError as exc:
+            return self._json_response(
+                503, {"ok": False, "error": str(exc) or STUDY_PLAN_RATE_LIMIT_MESSAGE}
+            )
+        except GroqConfigurationError:
+            return self._json_response(
+                503, {"ok": False, "error": "The study assistant is not configured on the server."}
+            )
+        except Exception:
+            self.log_message("Study plan generation failed")
+            return self._json_response(
+                502,
+                {"ok": False, "error": "The study assistant is unavailable right now."},
+            )
+
+        return self._json_response(
+            200, {"ok": True, "ai": True, "summary": plan["summary"], "tasks": plan["tasks"]}
+        )
 
     # ── Goals (authenticated, per-user) ───────────────────────────
 
@@ -1372,6 +1629,13 @@ class Handler(BaseHTTPRequestHandler):
         # ── API routes: topic quizzes (authenticated) ─────────────
         if path == "/api/quiz/status":
             return self._handle_quiz_status()
+        if path == "/api/quiz/goals":
+            return self._handle_quiz_goal_statuses()
+        if path.startswith("/api/quiz/goal/"):
+            goal_id = path[len("/api/quiz/goal/"):].strip()
+            if goal_id and "/" not in goal_id:
+                return self._handle_quiz_goal_status(goal_id)
+            return self._json_response(404, {"error": "Not found"})
         if path.startswith("/api/quiz/") and "/" not in path[len("/api/quiz/"):]:
             quiz_id = path[len("/api/quiz/"):].strip()
             if quiz_id:
@@ -1380,6 +1644,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/roadmaps/refresh":
             return self._handle_roadmaps_refresh()
 
+        # A GET on the planner path is not a route; keep the JSON 404 shape.
         if path.startswith("/api/"):
             return self._json_response(404, {"error": "Not found", "videos": []})
 
@@ -1420,6 +1685,9 @@ def main() -> None:
     print("  AI generate quiz:  POST /api/ai/generate-quiz")
     print("  Quiz prep:         POST /api/quiz/prepare (background)")
     print("  Quiz status:       GET  /api/quiz/status?topic=<topic>")
+    print("  Goal quiz prep:    POST /api/quiz/goal/<goalId>/prepare (background)")
+    print("  Goal quiz status:  GET  /api/quiz/goal/<goalId>")
+    print("  Goal quizzes:      GET  /api/quiz/goals (all stored goal quizzes)")
     print("  Quiz:              GET  /api/quiz/<id>")
     print("  Quiz answer:       POST /api/quiz/<id>/answer")
     print("  Quiz submit:       POST /api/quiz/<id>/submit")
@@ -1427,6 +1695,7 @@ def main() -> None:
     print("  AI recommend:      POST /api/ai/recommend-next-topic")
     print("  Roadmap catalog:   GET  /api/roadmaps/catalog (metadata only)")
     print("                     POST /api/roadmaps/refresh")
+    print("                     POST /api/study-plan/plan")
     print("  Goals:             GET|POST /api/goals")
     print("                     GET|PUT|DELETE /api/goals/<id>")
     print("                     POST /api/goals/<id>/{pause,resume,complete,archive,restore,set-primary}")

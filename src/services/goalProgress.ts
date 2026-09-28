@@ -20,6 +20,16 @@ export function topicQuizLessonId(name: string): string {
   return `topic-${hay.replace(/\s/g, '-')}`
 }
 
+/**
+ * The attempt lesson id for a goal's own 10/10/10 quiz. A goal quiz is its own
+ * record, distinct from the per-topic quizzes inside the goal roadmap, so
+ * progress for a goal is never confused with a single lesson's score.
+ */
+export function goalQuizLessonId(goalId: string): string {
+  const hay = (goalId || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()
+  return `goal-quiz-${hay.replace(/\s/g, '-') || 'goal'}`
+}
+
 export type GoalTopicStatus =
   | 'completed'
   | 'needs-practice'

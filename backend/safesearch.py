@@ -246,6 +246,46 @@ _CATEGORY_PHRASES: dict[str, tuple[str, ...]] = {
         "live sex",
         "sex chat",
     ),
+    # Violence aimed at PEOPLE. Every phrase names the human target on purpose:
+    # "how to kill a process" / "kill a thread" / "kill the app" are ordinary
+    # programming questions and must keep working, so a bare "how to kill" is
+    # never blocked.
+    "EXTREME_VIOLENCE": (
+        "kill a person",
+        "kill people",
+        "kill someone",
+        "kill somebody",
+        "kill humans",
+        "kill a human",
+        "kill a man",
+        "kill a woman",
+        "kill a child",
+        "kill children",
+        "kill my wife",
+        "kill my husband",
+        "how to murder",
+        "murder a person",
+        "murder someone",
+        "murder people",
+        "how to assassinate",
+        "assassinate someone",
+        "how to shoot someone",
+        "how to shoot people",
+        "how to stab someone",
+        "how to strangle someone",
+        "how to strangle a person",
+        "how to poison someone",
+        "how to poison a person",
+        "how to hurt people",
+        "how to maim",
+        "how to torture someone",
+        "beat someone to death",
+        "torture someone",
+        "school shooting",
+        "mass shooting",
+        "how to make a molotov",
+        "molotov cocktail",
+    ),
 }
 
 # Soft sexual intent patterns: adjective + content-noun pairs such as

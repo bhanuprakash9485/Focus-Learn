@@ -91,8 +91,14 @@ export interface QuizQuestion {
 
 export interface Quiz {
   id: string
-  lessonId: string
-  title: string
+  /**
+   * Curated quizzes (from the static catalog) carry camelCase `lessonId` and
+   * `title`. A quiz served by the API carries neither: it reports
+   * `lesson_id`/`topic` below, so both are optional here and the UI always
+   * prefers the snake_case field and falls back to these.
+   */
+  lessonId?: string
+  title?: string
   questions: QuizQuestion[]
   /** Where the quiz came from: curated catalog or AI-generated topic quiz. */
   source?: 'curated' | 'topic'
@@ -108,6 +114,20 @@ export interface Quiz {
   focus_concepts?: string[]
   /** Id of the parent quiz when this is a targeted retest. */
   retest_of?: string | null
+  /** Goal this quiz belongs to, when it was generated for a goal. */
+  goal_id?: string | null
+  /** "goal" for a goal quiz, "topic" for a lesson topic quiz. */
+  scope?: 'goal' | 'topic'
+  /** Questions in the set — always 30 (10 per tier) for a complete quiz. */
+  total?: number
+  /** Questions a complete quiz must have (30). */
+  expected_total?: number
+  /** Questions per difficulty tier in this set. */
+  difficulty_counts?: Record<QuizDifficulty, number>
+  /** True when the set passed every validation check (10/10/10, 4 options). */
+  valid?: boolean
+  /** 'ai_generated_original' for AI-written, validated question sets. */
+  source_type?: string
 }
 
 /** Per-difficulty score within a quiz attempt. */
@@ -151,6 +171,16 @@ export interface TopicQuizStatus {
   answers: TopicQuizAnswerRecord[]
   /** True when a targeted weak-concept retest quiz is ready. */
   retest_ready: boolean
+  /** Generation progress, so the UI can show which tier is being prepared. */
+  stage?: QuizGenerationStage | null
+  /** Questions a complete quiz must have (30). */
+  expected_total?: number
+  /** Goal this quiz belongs to, when it was generated for a goal. */
+  goal_id?: string | null
+  /** Per-difficulty progress, including the unlock requirement. */
+  tiers?: GoalQuizTier[]
+  /** 'ai_generated_original' for AI-written, validated question sets. */
+  source_type?: string
 }
 
 /** Result of submitting a quiz — authoritative scoring from the server. */
@@ -163,6 +193,94 @@ export interface TopicQuizSubmission {
   weak_concepts: string[]
   strong_concepts: string[]
   completed: boolean
+}
+
+/** Number of questions every goal has in each difficulty tier. */
+export const QUESTIONS_PER_TIER = 10
+
+/** Number of difficulty tiers in a goal quiz (10 each = 30 total). */
+export const GOAL_QUIZ_TIER_COUNT = 3
+
+/**
+ * Learner-facing name of each difficulty tier.
+ *
+ * The internal id stays "advanced" (it is the wire format the API stores and
+ * returns), but a student never sees it: every quiz surface must use this map,
+ * so the hardest tier always reads "Difficult".
+ */
+export const QUIZ_DIFFICULTY_LABEL: Record<QuizDifficulty, string> = {
+  basic: 'Basic',
+  moderate: 'Moderate',
+  advanced: 'Difficult',
+}
+
+/**
+ * Generation stage of a goal quiz. Reported while the background run works
+ * through the tiers, so the UI can show what is already prepared.
+ */
+export type QuizGenerationStage =
+  | 'preparing'
+  | 'basic_ready'
+  | 'moderate_ready'
+  | 'difficult_ready'
+  | 'complete'
+  | 'failed'
+
+/** What the student must do before a locked tier opens up. */
+export interface QuizTierRequirement {
+  text: string
+  attempts_needed: number
+  attempts_done: number
+}
+
+/** One difficulty tier of a goal quiz. */
+export interface GoalQuizTier {
+  difficulty: QuizDifficulty
+  /** "Basic" | "Moderate" | "Difficult" (the UI never shows "advanced"). */
+  label: string
+  question_count: number
+  expected_count: number
+  ready: boolean
+  attempts: number
+  correct: number
+  unlocked: boolean
+  requirement: QuizTierRequirement | null
+}
+
+/**
+ * Authoritative status of a goal's own 10/10/10 quiz. The server is the single
+ * source of truth for generation, persistence, attempts and unlocking.
+ */
+export interface GoalQuizStatus {
+  quiz_id: string | null
+  goal_id: string
+  topic: string | null
+  lesson_id: string | null
+  state: QuizGenerationState
+  stage: QuizGenerationStage | null
+  error: string | null
+  total: number
+  question_count: number
+  expected_total: number
+  completed: boolean
+  attempts: Record<QuizDifficulty, number>
+  unlocked: Record<QuizDifficulty, boolean>
+  difficulty_counts: Record<QuizDifficulty, number>
+  tiers: GoalQuizTier[]
+  answers: TopicQuizAnswerRecord[]
+  /** True when a complete, validated quiz is already stored for this goal. */
+  retest_ready: boolean
+  /** Every question is AI-written and passed the originality checks. */
+  source_type?: string
+}
+
+/** Response of starting (or reusing) a goal quiz. */
+export interface GoalQuizPrepareResult {
+  quiz_id: string
+  status: QuizGenerationState
+  goal_id?: string
+  /** True when an already-complete stored quiz was reused (no AI call). */
+  cached?: boolean
 }
 
 /** Feedback for one submitted answer, including live unlock state. */
@@ -535,4 +653,127 @@ export interface RecommendedPlaylist {
   videos: RecommendedPlaylistVideo[]
   /** The first safe, available video — where "Start Learning" begins. */
   firstVideo: { id: string; title: string } | null
+}
+
+/* ------------------------------------------------------------------ */
+/* Study plan (adaptive, persisted per user)                          */
+/* ------------------------------------------------------------------ */
+
+/** Scheduling priority. Never affects question difficulty. */
+export type StudyPriority = 'high' | 'medium' | 'low'
+
+/**
+ * Task lifecycle.
+ *  planned  - scheduled, not started
+ *  missed   - its day passed without the real activity happening
+ *  done     - the underlying real activity happened (lesson read / quiz submitted)
+ */
+export type StudyTaskStatus = 'planned' | 'missed' | 'done'
+
+/** What a task actually is. Completion is always driven by real activity. */
+export type StudyTaskKind = 'lesson' | 'quiz' | 'review'
+
+/** One scheduled learning task. Mirrors the roadmap + real activity. */
+export interface StudyTask {
+  /** Stable id so rescheduling/marking survives a reload. */
+  id: string
+  kind: StudyTaskKind
+  /** Roadmap lesson id, AI-roadmap topic id, or the topic string for a quiz. */
+  ref: string
+  title: string
+  /** Planned day as YYYY-MM-DD. */
+  date: string
+  /** Planned minutes for this task. */
+  estimatedMinutes: number
+  /** Real minutes actually spent on this task (0 until activity exists). */
+  actualMinutes: number
+  priority: StudyPriority
+  status: StudyTaskStatus
+  /** Where the suggestion came from: the rules engine or the AI assistant. */
+  source: 'auto' | 'ai'
+  /** Original date when this task was moved forward after being missed. */
+  rescheduledFrom?: string
+  /** Why the planner chose this task (real-data reason, never invented). */
+  reason?: string
+  /** Real minutes logged by the underlying activity, for lessons/quizzes. */
+  completedAt?: string
+}
+
+/** Persisted per-user study plan state. */
+export interface StudyPlanState {
+  /** Minutes the student wants per day (15/25/30/45/60). */
+  dailyTargetMinutes: number
+  /** Scheduled tasks, always in date order. */
+  tasks: StudyTask[]
+  /** When the current plan was last applied (ISO date). */
+  updatedAt: string | null
+  /** Set when an AI/replan preview is waiting for confirmation. */
+  pendingPreview: StudyPlanPreview | null
+}
+
+/** A plan the user can preview before committing (AI or Replan My Week). */
+export interface StudyPlanPreview {
+  /** Tasks proposed for the coming days. */
+  tasks: StudyTask[]
+  /** Human summary, e.g. "You missed 2 sessions...". */
+  summary: string
+  /** True when produced by Groq, false when the rules engine was used. */
+  fromAi: boolean
+}
+
+/** A single day in the weekly view. */
+export interface StudyPlanDay {
+  /** YYYY-MM-DD */
+  date: string
+  /** Mon/Tue/... label. */
+  label: string
+  tasks: StudyTask[]
+  plannedMinutes: number
+  actualMinutes: number
+  isToday: boolean
+  isPast: boolean
+}
+
+/** Real weekly numbers — every field derived from stored activity. */
+export interface StudyPlanStats {
+  plannedMinutes: number
+  actualMinutes: number
+  completionPercent: number
+  tasksDone: number
+  tasksTotal: number
+  lessonsDone: number
+  lessonsTotal: number
+  quizzesDone: number
+  quizzesTotal: number
+}
+
+/** Real context sent to the backend AI planner. */
+export interface StudyPlanAiContext {
+  goalTitle: string
+  targetDate: string | null
+  dailyTargetMinutes: number
+  today: string
+  /** Real finished lessons. */
+  completedLessonIds: string[]
+  /** Real quiz attempts (topicName + percentage). */
+  attempts: { topic: string; percentage: number }[]
+  /** Real weak topics from missed questions. */
+  weakTopics: string[]
+  /** Candidates the planner may choose from (roadmap order = dependency order). */
+  candidates: StudyPlanCandidate[]
+  /** Days already missed with unfinished work. */
+  missedCount: number
+}
+
+/** One schedulable roadmap topic handed to the planner. */
+export interface StudyPlanCandidate {
+  ref: string
+  title: string
+  kind: StudyTaskKind
+  /** Estimated minutes from the real roadmap. */
+  minutes: number
+  /** Ids of topics that must be finished first. */
+  prerequisites: string[]
+  /** Real roadmap step title, used for dependency grouping. */
+  stepTitle: string
 }

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getQuizStatus, prepareQuiz, TopicQuizError } from '../services/topicQuiz'
 import type { TopicQuizStatus } from '../types'
+import { QUESTIONS_PER_TIER, GOAL_QUIZ_TIER_COUNT, QUIZ_DIFFICULTY_LABEL } from '../types'
 import { IconCheck, IconLock, IconQuiz, IconSparkles } from './Icons'
 
 function sleep(ms: number): Promise<void> {
@@ -93,7 +94,9 @@ export default function TopicQuizCard({ topic }: { topic: string }) {
           <span className="small muted">Preparing your quiz…</span>
         </div>
         <p className="faint" style={{ fontSize: '0.78rem', marginTop: '0.3rem' }}>
-          30 Questions · 10 Basic · 10 Moderate · 10 Advanced
+          {QUESTIONS_PER_TIER * GOAL_QUIZ_TIER_COUNT} Questions · {QUESTIONS_PER_TIER} Basic
+          · {QUESTIONS_PER_TIER} Moderate · {QUESTIONS_PER_TIER}{' '}
+          {QUIZ_DIFFICULTY_LABEL.advanced}
         </p>
       </div>
     )
@@ -153,9 +156,7 @@ export default function TopicQuizCard({ topic }: { topic: string }) {
           {(['basic', 'moderate', 'advanced'] as const).map((d) => (
             <span key={d} className={`quiz-tier-pill ${status.unlocked[d] ? 'unlocked' : 'locked'}`}>
               {status.unlocked[d] ? <IconCheck size={12} /> : <IconLock size={12} />}
-              {d === 'basic' && 'Basic'}
-              {d === 'moderate' && 'Moderate'}
-              {d === 'advanced' && 'Advanced'}
+              {QUIZ_DIFFICULTY_LABEL[d]}
             </span>
           ))}
         </div>
@@ -177,7 +178,7 @@ export default function TopicQuizCard({ topic }: { topic: string }) {
           )}
         </div>
         <p className="faint" style={{ fontSize: '0.78rem', marginTop: '0.4rem' }}>
-          Answer 3 Basic → Moderate, 3 Moderate → Advanced.
+          Answer 3 Basic → Moderate, 3 Moderate → {QUIZ_DIFFICULTY_LABEL.advanced}.
         </p>
       </div>
     )
